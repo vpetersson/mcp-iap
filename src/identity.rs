@@ -4,7 +4,7 @@
 //! upstream credential. Only its sha256 needs to live in the config file, and
 //! lookup is constant-time-ish by hash so the plaintext never has to be compared.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,12 +16,18 @@ pub fn token_hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.trim().as_bytes()))
 }
 
-/// Generate a fresh agent token. 32 bytes of randomness, URL-safe.
-pub fn generate_token() -> String {
-    use rand::RngCore;
+/// Generate a fresh agent token: 32 bytes from the OS CSPRNG, hex-encoded.
+///
+/// Fallible on purpose. `rand` surfaces entropy failures rather than panicking,
+/// and a token this process cannot generate securely must stop it rather than
+/// quietly become something weaker.
+pub fn generate_token() -> Result<String> {
+    use rand::TryRng;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    format!("iap_{}", hex::encode(bytes))
+    rand::rng()
+        .try_fill_bytes(&mut bytes)
+        .context("drawing 32 random bytes from the operating system")?;
+    Ok(format!("iap_{}", hex::encode(bytes)))
 }
 
 #[derive(Debug)]
@@ -151,8 +157,13 @@ token_sha256 = "{}"
 
     #[test]
     fn generated_tokens_are_unique_and_prefixed() {
-        let one = generate_token();
+        let one = generate_token().unwrap();
         assert!(one.starts_with("iap_"));
-        assert_ne!(one, generate_token());
+        assert_eq!(
+            one.len(),
+            4 + 64,
+            "32 bytes, hex encoded, behind the prefix"
+        );
+        assert_ne!(one, generate_token().unwrap());
     }
 }

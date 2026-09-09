@@ -126,10 +126,7 @@ fn main() -> Result<()> {
             ))
         }
         Command::Check { config } => check(&config.config),
-        Command::GenToken { id } => {
-            gen_token(&id);
-            Ok(())
-        }
+        Command::GenToken { id } => gen_token(&id),
         Command::HashToken { token } => {
             let token = match token {
                 Some(token) => token,
@@ -360,8 +357,8 @@ fn check(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn gen_token(id: &str) {
-    let token = identity::generate_token();
+fn gen_token(id: &str) -> Result<()> {
+    let token = identity::generate_token()?;
     let hash = identity::token_hash(&token);
     println!("Give this token to the agent — it is not any upstream credential:\n");
     println!("  {token}\n");
@@ -370,6 +367,7 @@ fn gen_token(id: &str) {
     println!("id = \"{id}\"");
     println!("token_sha256 = \"{hash}\"");
     println!("# targets = [\"anthropic\"]   # optional: restrict which upstreams it may address");
+    Ok(())
 }
 
 fn verify_audit(path: &Path) -> Result<()> {

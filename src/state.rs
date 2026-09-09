@@ -57,7 +57,7 @@ impl AppState {
                 .context("resolving server.admin_token")?
                 .expose()
                 .to_string(),
-            None => crate::identity::generate_token(),
+            None => crate::identity::generate_token()?,
         };
 
         Ok(Arc::new(AppState {
