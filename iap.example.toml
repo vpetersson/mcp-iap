@@ -1,0 +1,129 @@
+# mcp-iap policy file.
+#
+# Nothing here is a credential — only *references* to credentials, resolved
+# inside the proxy at startup. This file is safe to commit.
+
+[server]
+listen = "127.0.0.1:8080"        # where agents connect
+admin_listen = "127.0.0.1:8081"  # control plane: the TUI and the MCP bridge
+approval_timeout_secs = 120      # an unanswered `ask` denies after this
+upstream_timeout_secs = 300
+max_body_bytes = 10485760
+# op_binary = "op"               # 1Password CLI used for op:// references
+# admin_token = "env:IAP_ADMIN_TOKEN"  # otherwise generated and written to ./admin-token
+
+[audit]
+path = "audit/iap-audit.jsonl"
+stderr = true
+log_bodies = false               # bodies carry prompts and customer data
+log_mcp_params = false           # JSON-RPC params likewise
+max_logged_body_bytes = 4096
+redact_headers = ["authorization", "x-api-key", "cookie", "x-iap-token"]
+
+# --- who may connect -------------------------------------------------------
+# Mint a token with `mcp-iap gen-token claude-code`. It is not an upstream
+# credential; revoking it costs nothing and rotates nothing else.
+
+[[agents]]
+id = "claude-code"
+name = "Claude Code"
+token_sha256 = "REPLACE_ME_WITH_THE_OUTPUT_OF_gen-token"
+targets = ["anthropic", "github", "github-mcp"]
+
+# --- what they may reach ---------------------------------------------------
+# The agent calls http://127.0.0.1:8080/<name>/<path>; the proxy strips the
+# prefix and adds the real credential.
+
+[[upstreams]]
+name = "anthropic"
+base_url = "https://api.anthropic.com"
+auth = { type = "header", header = "x-api-key", secret = "op://Private/Anthropic API/credential" }
+headers = { "anthropic-version" = "2023-06-01" }
+
+[[upstreams]]
+name = "github"
+base_url = "https://api.github.com"
+auth = { type = "bearer", secret = "op://Private/GitHub/token" }
+
+# Other supported schemes:
+#   auth = { type = "basic", username = "user", secret = "env:PASSWORD" }
+#   auth = { type = "query", param = "key", secret = "file:/run/secrets/key" }
+#   auth = { type = "oauth2_client_credentials", token_url = "https://issuer/oauth/token",
+#            client_id = "abc", client_secret = "op://Private/IdP/client_secret",
+#            scope = "read:data" }
+#   auth = { type = "none" }
+
+# --- MCP servers -----------------------------------------------------------
+# The agent runs `mcp-iap mcp --server github-mcp` as its MCP server. The real
+# server is spawned here, with the credential in *its* environment.
+
+[[mcp_servers]]
+name = "github-mcp"
+transport = "stdio"
+command = "docker"
+args = ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"]
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "op://Private/GitHub/token" }
+
+# A remote MCP endpoint instead:
+# [[mcp_servers]]
+# name = "remote-mcp"
+# transport = "http"
+# url = "https://mcp.example.com/mcp"
+# auth = { type = "bearer", secret = "op://Private/Example/token" }
+
+# --- policy ----------------------------------------------------------------
+# First matching rule wins. Anything unmatched falls through to acl_default.
+# `paths` are URL paths for http and tool / resource names for mcp.
+
+[[acl]]
+name = "anthropic-inference"
+agent = "claude-code"
+kind = "http"
+target = "anthropic"
+methods = ["POST"]
+paths = ["/v1/messages", "/v1/messages/count_tokens"]
+action = "allow"
+
+[[acl]]
+name = "github-reads"
+agent = "claude-code"
+kind = "http"
+target = "github"
+methods = ["GET"]
+paths = ["/repos/**", "/user", "/search/**"]
+action = "allow"
+
+[[acl]]
+name = "github-writes-need-a-human"
+agent = "claude-code"
+kind = "http"
+target = "github"
+methods = ["POST", "PATCH", "PUT", "DELETE"]
+paths = ["/repos/**"]
+action = "ask"
+
+# MCP: the handshake and discovery are harmless, so allow them outright.
+[[acl]]
+name = "mcp-handshake"
+kind = "mcp"
+target = "github-mcp"
+methods = ["initialize", "ping", "notifications/*", "tools/list", "resources/list", "prompts/list"]
+action = "allow"
+
+[[acl]]
+name = "mcp-reads"
+kind = "mcp"
+target = "github-mcp"
+methods = ["tools/call"]
+paths = ["get_*", "list_*", "search_*"]
+action = "allow"
+
+# Everything else this server can do gets a prompt rather than a silent yes.
+[[acl]]
+name = "mcp-anything-else-asks"
+kind = "mcp"
+target = "github-mcp"
+action = "ask"
+
+[acl_default]
+action = "deny"
