@@ -22,7 +22,7 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 globset = "0.4"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }
