@@ -30,7 +30,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 parking_lot = "0.12"
 zeroize = "1"
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = "0.29"
 url = { version = "2", features = ["serde"] }
 rand = "0.8"
 indexmap = "2"
