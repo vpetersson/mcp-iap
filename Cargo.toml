@@ -32,7 +32,7 @@ zeroize = "1"
 ratatui = "0.29"
 crossterm = "0.28"
 url = { version = "2", features = ["serde"] }
-rand = "0.8"
+rand = "0.10"
 indexmap = "2"
 
 [dev-dependencies]
