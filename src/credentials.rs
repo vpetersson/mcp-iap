@@ -19,7 +19,14 @@ use crate::service_account::{ServiceAccount, JWT_BEARER_GRANT};
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
 
 /// Assume this lifetime when a provider returns a token without `expires_in`.
-const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
+///
+/// Deliberately short. Guessing an hour and being wrong means an hour of 401s;
+/// guessing five minutes and being wrong costs one extra token request.
+const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(300);
+
+/// Ignore any `expires_in` beyond this. A provider claiming a year either means
+/// something else by it or is broken, and `Instant + Duration` panics on overflow.
+const MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(24 * 3600);
 
 pub struct CredentialInjector {
     resolver: Arc<SecretResolver>,
@@ -163,10 +170,9 @@ impl CredentialInjector {
             .unwrap_or_default()
             .to_string();
 
-        self.token_cache.lock().insert(
-            target.to_string(),
-            (token.clone(), Instant::now() + lifetime),
-        );
+        self.token_cache
+            .lock()
+            .insert(target.to_string(), (token.clone(), usable_until(lifetime)));
 
         if let Some(audit) = &self.audit {
             let mut record = AuditRecord::new("credential", "token_minted");
@@ -175,16 +181,31 @@ impl CredentialInjector {
             record.method = "POST".into();
             record.path = token_url;
             record.detail = Some(detail);
-            audit.write(record);
+
+            if let Err(error) = audit.write(record) {
+                // Drop it again rather than let an unrecorded credential circulate.
+                self.token_cache.lock().remove(target);
+                return Err(error).with_context(|| {
+                    format!("minted a token for `{target}` but could not record it")
+                });
+            }
         }
 
         Ok(token)
     }
 
+    /// Drop a target's cached token — used when an upstream rejects it, so the
+    /// next request mints a fresh one instead of replaying the failure.
+    pub fn invalidate(&self, target: &str) {
+        if self.token_cache.lock().remove(target).is_some() {
+            tracing::info!(target, "discarded a minted token the upstream rejected");
+        }
+    }
+
     fn cached_token(&self, target: &str) -> Option<Secret> {
         let cache = self.token_cache.lock();
         let (token, expires_at) = cache.get(target)?;
-        (Instant::now() + TOKEN_REFRESH_MARGIN < *expires_at).then(|| token.clone())
+        (Instant::now() < *expires_at).then(|| token.clone())
     }
 
     fn gate(&self, target: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -320,9 +341,21 @@ impl CredentialInjector {
         let lifetime = parsed
             .expires_in
             .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_TOKEN_LIFETIME);
+            .unwrap_or(DEFAULT_TOKEN_LIFETIME)
+            .min(MAX_TOKEN_LIFETIME);
         Ok((Secret::new(parsed.access_token), lifetime))
     }
+}
+
+/// When a freshly minted token stops being safe to reuse.
+///
+/// Normally that is a minute before it expires. For a token that lives a minute
+/// or less, subtracting a whole minute would mean never caching it at all — one
+/// signature and one round trip per proxied request — so short tokens keep half
+/// their life instead.
+fn usable_until(lifetime: Duration) -> Instant {
+    let margin = TOKEN_REFRESH_MARGIN.min(lifetime / 2);
+    Instant::now() + lifetime.saturating_sub(margin)
 }
 
 fn set_header(request: &mut reqwest::Request, name: &str, value: &str) -> Result<()> {
@@ -455,6 +488,46 @@ mod tests {
             .await
             .unwrap();
         assert!(req.headers().is_empty());
+    }
+
+    #[test]
+    fn a_short_lived_token_is_still_cached_for_part_of_its_life() {
+        let now = Instant::now();
+        // An hour-long token is refreshed a minute early.
+        let long = usable_until(Duration::from_secs(3600));
+        assert!(long > now + Duration::from_secs(3500));
+        assert!(long < now + Duration::from_secs(3600));
+
+        // A 30-second token keeps half of it rather than none of it.
+        let short = usable_until(Duration::from_secs(30));
+        assert!(
+            short > now + Duration::from_secs(10),
+            "a short token must still be cached"
+        );
+        assert!(short < now + Duration::from_secs(30));
+
+        // And a zero-length one is simply never usable.
+        assert!(usable_until(Duration::ZERO) <= Instant::now());
+    }
+
+    #[tokio::test]
+    async fn invalidate_forgets_a_rejected_token() {
+        let injector = injector();
+        injector.token_cache.lock().insert(
+            "gcs".into(),
+            (
+                Secret::new("stale".into()),
+                Instant::now() + Duration::from_secs(3600),
+            ),
+        );
+        assert!(injector.cached_token("gcs").is_some());
+        injector.invalidate("gcs");
+        assert!(
+            injector.cached_token("gcs").is_none(),
+            "a token the upstream rejected must not be served again"
+        );
+        // Invalidating something that was never cached is harmless.
+        injector.invalidate("nothing-here");
     }
 
     #[test]

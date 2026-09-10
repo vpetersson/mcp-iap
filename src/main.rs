@@ -193,7 +193,7 @@ async fn run(config: Config, tui: bool) -> Result<()> {
     let audit_to_stderr = config.audit.stderr && !tui;
 
     let state = AppState::build(config, audit_to_stderr)?;
-    state.log_startup();
+    state.log_startup()?;
 
     // The console and the control API are the only things that can answer an
     // `ask`. Without either, `ask` denies rather than hanging.
@@ -277,12 +277,32 @@ fn write_admin_token(audit_path: &Path, token: &str) -> Result<PathBuf> {
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).ok();
     let path = dir.join("admin-token");
-    std::fs::write(&path, token).with_context(|| format!("writing `{}`", path.display()))?;
+
+    // Created 0600 rather than created-then-chmodded: the old order left the
+    // token world-readable for however long the chmod took, and discarded the
+    // chmod's own failure on top of that.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("creating `{}`", path.display()))?;
+
+    // An existing file keeps its old mode, so tighten it either way.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting `{}` to the current user", path.display()))?;
     }
+
+    use std::io::Write;
+    file.write_all(token.as_bytes())
+        .with_context(|| format!("writing `{}`", path.display()))?;
     Ok(path)
 }
 

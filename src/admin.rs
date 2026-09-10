@@ -58,10 +58,14 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 /// `Some(response)` means "not an operator" — return it and stop.
 fn reject_non_admin(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    match bearer(headers) {
-        Some(token) if token == state.admin_token => None,
-        _ => Some(error(StatusCode::UNAUTHORIZED, "admin token required")),
-    }
+    let presented = bearer(headers).unwrap_or_default();
+    // Agent tokens are matched by hash lookup, which gives nothing away. This
+    // was the one credential compared byte-for-byte, so compare digests instead:
+    // where `==` stops tells an attacker about the hash, not about the token.
+    let matches =
+        crate::identity::token_hash(presented) == crate::identity::token_hash(&state.admin_token);
+
+    (!matches).then(|| error(StatusCode::UNAUTHORIZED, "admin token required"))
 }
 
 fn error(status: StatusCode, message: &str) -> Response {
@@ -219,7 +223,7 @@ async fn authorize(
     if !agent_may_address(&agent, &body.target) {
         record.decision = Some("deny".into());
         record.rule = Some("<agent-targets>".into());
-        state.audit.write(record);
+        state.audit.write_best_effort(record);
         return Json(AuthorizeResult {
             allowed: false,
             decision: "deny".into(),
@@ -267,7 +271,22 @@ async fn authorize(
         }
     };
 
-    state.audit.write(record);
+    // Same rule as the proxy: an allow that cannot be recorded is not an allow.
+    if let Err(error) = state.audit.write(record) {
+        tracing::error!(
+            ?error,
+            "refusing an authorization that could not be audited"
+        );
+        if result.allowed {
+            return Json(AuthorizeResult {
+                allowed: false,
+                decision: "audit_unavailable".into(),
+                rule: result.rule,
+                reason: Some("permitted by policy but not recordable, so refused".into()),
+            })
+            .into_response();
+        }
+    }
     Json(result).into_response()
 }
 
@@ -305,6 +324,15 @@ async fn record_event(
             "a delegate may only record session_start, session_end, response or error",
         );
     }
+    // The MCP bridge calls this before it resolves any credential, so this is
+    // where an agent reaching for a server it was never granted gets stopped —
+    // ahead of the key existing in a process the agent controls.
+    if !body.target.is_empty() && !agent_may_address(&agent, &body.target) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "this agent may not address that target",
+        );
+    }
 
     let mut record = AuditRecord::new(body.kind.as_str(), &body.event);
     record.agent = agent.id.clone();
@@ -314,7 +342,12 @@ async fn record_event(
     record.path = body.path;
     record.error = body.error;
     record.detail = body.detail;
-    state.audit.write(record);
+    if state.audit.write_best_effort(record).is_none() {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the event could not be written to the audit log",
+        );
+    }
 
     Json(serde_json::json!({ "ok": true })).into_response()
 }
