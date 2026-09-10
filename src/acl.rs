@@ -174,6 +174,15 @@ impl Acl {
         self.rules.len()
     }
 
+    /// How many rules could ever apply to a target. Used to catch a config that
+    /// grants an agent an upstream the policy never mentions, which denies.
+    pub fn rules_mentioning(&self, target: &str) -> usize {
+        self.rules
+            .iter()
+            .filter(|rule| rule.target.is_match(target))
+            .count()
+    }
+
     pub fn default_action(&self) -> Action {
         self.default
     }

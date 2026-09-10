@@ -175,6 +175,13 @@ the first call. PKCS#1 keys (`BEGIN RSA PRIVATE KEY`) are rejected with the
 `openssl` command that converts them. Every mint is recorded in the audit log
 with the issuer, scopes and expiry — never the token.
 
+### Timeouts
+
+`upstream_timeout_secs` (default 300) is an **idle** timeout — the longest an
+upstream may go silent mid-response. A token-by-token LLM response can stream for
+as long as it likes provided it keeps arriving. `upstream_connect_timeout_secs`
+(default 30) bounds establishing the connection.
+
 ### Where secrets come from
 
 `op://vault/item/field` (1Password CLI), `env:NAME`, `file:/path`, and
@@ -236,6 +243,12 @@ mcp-iap audit verify audit/iap-audit.jsonl
 
 Editing or removing a line is detected by `verify`. The chain resumes across
 restarts, so one file covers the life of the deployment.
+
+If a record cannot be written, the chain does not advance past it — a lost entry
+leaves the log verifiable rather than making everything after it read as
+tampered. And a request the proxy permitted but could not record does not reach
+the agent: an unrecorded call the agent can read from is the one outcome worth
+refusing outright, so it gets a 502 instead.
 
 Bodies are **not** logged by default (`audit.log_bodies`), nor are MCP `params`
 (`audit.log_mcp_params`) — both carry prompts and customer data. Credential
@@ -299,7 +312,7 @@ GCP metadata server and workload identity federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 83 tests: unit + end-to-end through a real proxy
+cargo test        # 88 tests: unit + end-to-end through a real proxy
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

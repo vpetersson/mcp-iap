@@ -41,15 +41,23 @@ pub struct ServerConfig {
     /// Control plane for the TUI and the MCP bridge. `false`/omitted disables it.
     #[serde(default = "default_admin_listen")]
     pub admin_listen: Option<SocketAddr>,
-    /// Shared secret for the control plane. Generated at startup when absent.
+    /// Shared secret for the control plane, as a secret reference (`env:`,
+    /// `file:`, `op://`). Generated at startup and written to `admin-token`
+    /// beside the audit log when absent.
     #[serde(default)]
     pub admin_token: Option<String>,
     /// How long an `ask` request waits for a human before failing closed.
     #[serde(default = "default_approval_timeout")]
     pub approval_timeout_secs: u64,
-    /// Upstream request timeout.
+    /// How long an upstream may go silent mid-response before the proxy gives up.
+    ///
+    /// This is an idle timeout, not a total one: a token-by-token LLM response
+    /// can stream for as long as it likes provided it keeps arriving.
     #[serde(default = "default_upstream_timeout")]
     pub upstream_timeout_secs: u64,
+    /// How long to wait for the upstream connection itself.
+    #[serde(default = "default_connect_timeout")]
+    pub upstream_connect_timeout_secs: u64,
     /// Largest request body the proxy will buffer.
     #[serde(default = "default_max_body")]
     pub max_body_bytes: usize,
@@ -66,6 +74,7 @@ impl Default for ServerConfig {
             admin_token: None,
             approval_timeout_secs: default_approval_timeout(),
             upstream_timeout_secs: default_upstream_timeout(),
+            upstream_connect_timeout_secs: default_connect_timeout(),
             max_body_bytes: default_max_body(),
             op_binary: default_op_bin(),
         }
@@ -83,6 +92,9 @@ fn default_approval_timeout() -> u64 {
 }
 fn default_upstream_timeout() -> u64 {
     300
+}
+fn default_connect_timeout() -> u64 {
+    30
 }
 fn default_max_body() -> usize {
     10 * 1024 * 1024
@@ -410,6 +422,10 @@ impl Config {
 
     /// Structural checks that would otherwise surface as a confusing runtime failure.
     pub fn validate(&self) -> Result<()> {
+        if let Some(reference) = &self.server.admin_token {
+            SecretRef::parse(reference).context("server.admin_token")?;
+        }
+
         let mut seen = std::collections::HashSet::new();
         for agent in &self.agents {
             if !seen.insert(&agent.id) {
@@ -511,6 +527,9 @@ impl Config {
     /// Every secret reference in the config, for `check` and startup preloading.
     pub fn secret_refs(&self) -> Vec<String> {
         let mut refs = Vec::new();
+        if let Some(reference) = &self.server.admin_token {
+            refs.push(reference.clone());
+        }
         for agent in &self.agents {
             if let Some(reference) = &agent.token_ref {
                 refs.push(reference.clone());
@@ -528,6 +547,10 @@ impl Config {
         refs
     }
 }
+
+/// Shortest assertion lifetime worth signing; below this, clock skew alone
+/// makes the token endpoint reject it.
+pub const MIN_ASSERTION_LIFETIME_SECS: u64 = 60;
 
 fn check_auth(auth: &AuthConfig, label: &str) -> Result<()> {
     for reference in auth.secret_refs() {
@@ -556,9 +579,9 @@ fn check_auth(auth: &AuthConfig, label: &str) -> Result<()> {
         // Either a Google JSON key, or the pieces spelled out — never a mixture,
         // because then it is ambiguous which issuer or key actually applies.
         match (key_file, private_key) {
-            (Some(_), Some(_)) => bail!(
-                "{label}: set either `key_file` or `private_key`, not both"
-            ),
+            (Some(_), Some(_)) => {
+                bail!("{label}: set either `key_file` or `private_key`, not both")
+            }
             (None, None) => bail!(
                 "{label}: a service-account credential needs `key_file`                  (a Google JSON key) or `private_key` plus `issuer` and `token_url`"
             ),
@@ -576,6 +599,21 @@ fn check_auth(auth: &AuthConfig, label: &str) -> Result<()> {
                 }
             }
         }
+        if let AuthConfig::ServiceAccountJwt {
+            lifetime_secs: Some(seconds),
+            ..
+        } = auth
+        {
+            // Clamping the ceiling was not enough: `0` produced `exp == iat` and
+            // an assertion every provider rejects, discovered one 502 at a time.
+            if *seconds < MIN_ASSERTION_LIFETIME_SECS {
+                bail!(
+                    "{label}: `lifetime_secs` must be at least {MIN_ASSERTION_LIFETIME_SECS}; \
+                     it is clamped to one hour at the top"
+                );
+            }
+        }
+
         for (field, value) in [("token_url", token_url), ("audience", audience)] {
             if let Some(value) = value {
                 url::Url::parse(value).with_context(|| format!("{label}: {field}"))?;
@@ -644,10 +682,27 @@ action = "allow"
     }
 
     /// The shipped example is documentation people copy, so it has to be real.
+    ///
+    /// The token placeholder is deliberately invalid — an unedited file must not
+    /// start — so the test fills it in the way a reader would before checking
+    /// the rest.
     #[test]
     fn the_example_config_parses_and_validates() {
         let text = include_str!("../iap.example.toml");
-        let config: Config = toml::from_str(text).expect("iap.example.toml must parse");
+        assert!(
+            text.contains("REPLACE_ME_WITH_THE_OUTPUT_OF_gen-token"),
+            "the example must ship a placeholder that fails validation"
+        );
+        assert!(
+            toml::from_str::<Config>(text).unwrap().validate().is_err(),
+            "an unedited example must refuse to start"
+        );
+
+        let filled = text.replace(
+            "REPLACE_ME_WITH_THE_OUTPUT_OF_gen-token",
+            &crate::identity::token_hash("iap_example"),
+        );
+        let config: Config = toml::from_str(&filled).expect("iap.example.toml must parse");
         config.validate().expect("iap.example.toml must validate");
 
         assert!(
@@ -659,6 +714,23 @@ action = "allow"
         );
         for reference in config.secret_refs() {
             SecretRef::parse(&reference).expect("every example secret reference must parse");
+        }
+
+        // Parsing is not the bar: every upstream the example grants an agent has
+        // to be reachable under the example's own policy, or copying the file
+        // produces a proxy that denies everything it advertises.
+        let acl = crate::acl::Acl::compile(&config).unwrap();
+        for agent in &config.agents {
+            for target in &agent.targets {
+                let reachable = config.upstreams.iter().any(|u| &u.name == target)
+                    || config.mcp_servers.iter().any(|s| &s.name == target);
+                assert!(reachable, "`{target}` is not a configured target");
+                assert!(
+                    acl.rules_mentioning(target) > 0,
+                    "the example grants `{}` access to `{target}` but no ACL rule ever names it",
+                    agent.id
+                );
+            }
         }
     }
 

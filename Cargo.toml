@@ -34,6 +34,8 @@ zeroize = "1"
 ratatui = "0.30"
 crossterm = "0.29"
 url = { version = "2", features = ["serde"] }
+# Already in the tree under `url`; used directly to decode paths before checking them.
+percent-encoding = "2"
 rand = "0.10"
 indexmap = "2"
 

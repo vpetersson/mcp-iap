@@ -7,7 +7,10 @@
 listen = "127.0.0.1:8080"        # where agents connect
 admin_listen = "127.0.0.1:8081"  # control plane: the TUI and the MCP bridge
 approval_timeout_secs = 120      # an unanswered `ask` denies after this
-upstream_timeout_secs = 300
+upstream_timeout_secs = 300          # idle timeout: how long an upstream may go
+                                     # silent mid-response, not a total cap, so a
+                                     # long token stream is never truncated
+upstream_connect_timeout_secs = 30
 max_body_bytes = 10485760
 # op_binary = "op"               # 1Password CLI used for op:// references
 # admin_token = "env:IAP_ADMIN_TOKEN"  # otherwise generated and written to ./admin-token
@@ -27,8 +30,10 @@ redact_headers = ["authorization", "x-api-key", "cookie", "x-iap-token"]
 [[agents]]
 id = "claude-code"
 name = "Claude Code"
-# Replace with the hash printed by `mcp-iap gen-token claude-code`.
-token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# Replace with the hash printed by `mcp-iap gen-token claude-code`. Left
+# deliberately invalid: an unedited policy file should refuse to start, not come
+# up looking healthy with an agent that can never authenticate.
+token_sha256 = "REPLACE_ME_WITH_THE_OUTPUT_OF_gen-token"
 targets = ["anthropic", "github", "gcs", "github-mcp"]
 
 # --- what they may reach ---------------------------------------------------
@@ -127,6 +132,15 @@ target = "github"
 methods = ["POST", "PATCH", "PUT", "DELETE"]
 paths = ["/repos/**"]
 action = "ask"
+
+[[acl]]
+name = "gcs-object-reads"
+agent = "claude-code"
+kind = "http"
+target = "gcs"
+methods = ["GET"]
+paths = ["/storage/v1/b/*/o", "/storage/v1/b/*/o/**"]
+action = "allow"
 
 # MCP: the handshake and discovery are harmless, so allow them outright.
 [[acl]]

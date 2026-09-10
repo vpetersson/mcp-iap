@@ -91,7 +91,7 @@ impl Rejection {
             if record.error.is_none() {
                 record.error = Some(self.message.clone());
             }
-            state.audit.write(record);
+            state.audit.write_best_effort(record);
         }
         let body = serde_json::json!({
             "error": { "type": self.code, "message": self.message },
@@ -151,11 +151,22 @@ async fn proxy(
 
     // 2. Which upstream? `X-IAP-Upstream`, else the first path segment.
     let (upstream_name, upstream_path) = route(&parts.headers, &full_path).ok_or_else(|| {
+        // Refusals are audited even here: the agent is already identified, and a
+        // sweep for valid upstream names should leave a trace like anything else.
+        let mut record = AuditRecord::new("http", "denied");
+        record.agent = agent.id.clone();
+        record.agent_name = Some(agent.display_name().to_string());
+        record.method = method.to_string();
+        record.path = full_path.clone();
+        record.decision = Some("deny".into());
+        record.rule = Some("<no-route>".into());
+        record.client = Some(peer.to_string());
         Rejection::new(
             StatusCode::NOT_FOUND,
             "no_route",
             "no upstream in the request — use `/<upstream>/<path>` or set `X-IAP-Upstream`",
         )
+        .with_record(record)
     })?;
 
     let mut record = AuditRecord::new("http", "request");
@@ -166,17 +177,13 @@ async fn proxy(
     record.path = upstream_path.clone();
     record.client = Some(peer.to_string());
 
-    // `..` in a proxied path can climb out of the upstream's base path.
-    if upstream_path.split('/').any(|segment| segment == "..") {
+    // A path that climbs out of the upstream's base path would reach an endpoint
+    // the ACL never saw — with the real credential attached.
+    if let Err(reason) = check_path(&upstream_path) {
         record.decision = Some("deny".into());
         record.rule = Some("<path-traversal>".into());
         return Err(Box::new(
-            Rejection::new(
-                StatusCode::BAD_REQUEST,
-                "invalid_path",
-                "the request path contains a `..` segment",
-            )
-            .with_record(record),
+            Rejection::new(StatusCode::BAD_REQUEST, "invalid_path", reason).with_record(record),
         ));
     }
 
@@ -304,7 +311,7 @@ async fn proxy(
 
     let response = state.http.execute(outbound).await.map_err(|error| {
         let mut record = record.clone();
-        record.error = Some(error.to_string());
+        record.error = Some(describe_upstream_error(&error));
         record.duration_ms = Some(started.elapsed().as_millis() as u64);
         Rejection::new(
             StatusCode::BAD_GATEWAY,
@@ -314,12 +321,34 @@ async fn proxy(
         .with_record(record)
     })?;
 
+    // A minted token the upstream just rejected is worth nothing; drop it so the
+    // next request mints a fresh one rather than repeating the 401 until expiry.
+    if matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ) && upstream.auth.mints_tokens()
+    {
+        state.injector.invalidate(&upstream.name);
+    }
+
     // Recorded at response headers, so streamed (SSE) responses are logged when
     // they start rather than being buffered until they finish.
     record.status = Some(response.status().as_u16());
     record.duration_ms = Some(started.elapsed().as_millis() as u64);
     record.response_bytes = response.content_length();
-    state.audit.write(record);
+    // We permitted this and cannot record that we did. The agent does not get the
+    // response: the log is the product here, and an unrecorded call that the
+    // agent can read from is the one outcome worth refusing outright. The call
+    // upstream has already happened, so say so rather than pretending otherwise.
+    state.audit.write(record).map_err(|error| {
+        tracing::error!(?error, "withholding a response that could not be audited");
+        Box::new(Rejection::new(
+            StatusCode::BAD_GATEWAY,
+            "audit_unavailable",
+            "the request was permitted and performed, but could not be written to the \
+             audit log, so its response was withheld",
+        ))
+    })?;
 
     Ok(build_response(response))
 }
@@ -355,14 +384,69 @@ fn route(headers: &HeaderMap, path: &str) -> Option<(String, String)> {
     Some((name.to_string(), tail))
 }
 
+/// Reject any path that could mean one thing to the ACL and another to the URL
+/// parser that builds the outbound request.
+///
+/// `%2e%2e` is `..` to a URL parser and to nobody else, so a guard looking only
+/// for a literal `..` is not a guard. Backslashes matter for the same reason:
+/// the URL standard folds `\` into `/` for http(s).
+fn check_path(path: &str) -> Result<(), &'static str> {
+    let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+
+    for segment in decoded.split(['/', '\\']) {
+        if segment == ".." || segment == "." {
+            return Err("the request path contains a `.` or `..` segment, encoded or otherwise");
+        }
+    }
+    if decoded.contains('\0') {
+        return Err("the request path contains a NUL byte");
+    }
+    Ok(())
+}
+
+/// Join the upstream's base URL with the proxied path, and refuse if the result
+/// is not literally the path the ACL just approved.
+///
+/// `check_path` catches the encodings we know about; this catches the rest, by
+/// comparing what policy authorised against what will actually be requested.
 fn build_url(base: &str, path: &str, query: Option<&str>) -> anyhow::Result<url::Url> {
-    let mut raw = base.trim_end_matches('/').to_string();
+    let base = base.trim_end_matches('/');
+    let base_path = url::Url::parse(base)?
+        .path()
+        .trim_end_matches('/')
+        .to_string();
+    let approved_path = format!("{base_path}{path}");
+
+    let mut raw = base.to_string();
     raw.push_str(path);
     if let Some(query) = query {
         raw.push('?');
         raw.push_str(query);
     }
-    Ok(url::Url::parse(&raw)?)
+
+    let url = url::Url::parse(&raw)?;
+    if url.path() != approved_path {
+        anyhow::bail!("the request path does not survive URL normalisation unchanged");
+    }
+    Ok(url)
+}
+
+/// Describe an upstream failure without repeating anything from the request.
+///
+/// Never `error.to_string()`: reqwest's Display embeds the full outbound URL,
+/// which by this point carries the injected credential for `query` auth.
+fn describe_upstream_error(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "the upstream did not respond in time".to_string()
+    } else if error.is_connect() {
+        "could not connect to the upstream".to_string()
+    } else if error.is_body() || error.is_decode() {
+        "the upstream response could not be read".to_string()
+    } else if error.is_redirect() {
+        "the upstream redirected too many times".to_string()
+    } else {
+        "the upstream request failed".to_string()
+    }
 }
 
 fn forwarded_request_headers(incoming: &HeaderMap, upstream: &UpstreamConfig) -> HeaderMap {

@@ -1324,6 +1324,7 @@ dependencies = [
  "http",
  "indexmap",
  "parking_lot",
+ "percent-encoding",
  "rand 0.10.2",
  "ratatui",
  "reqwest",

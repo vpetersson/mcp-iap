@@ -187,7 +187,16 @@ impl AuditLog {
     }
 
     /// Append a record and return the sequenced event.
-    pub fn write(&self, record: AuditRecord) -> AuditEvent {
+    ///
+    /// The chain only advances when the line actually reached the file. A failed
+    /// write therefore leaves the log verifiable and simply missing that entry —
+    /// rather than advancing `seq` past a line that was never written and making
+    /// everything after it look tampered with.
+    ///
+    /// Callers decide what a failure means. On a path that is about to *allow*
+    /// something, it should mean refusing: a proxy that cannot record what it
+    /// permitted has no business permitting it.
+    pub fn write(&self, record: AuditRecord) -> Result<AuditEvent> {
         let mut guard = self.inner.lock();
         let mut event = AuditEvent {
             seq: guard.seq,
@@ -199,15 +208,11 @@ impl AuditLog {
         };
         event.hash = event.compute_hash();
 
-        match serde_json::to_string(&event) {
-            Ok(line) => {
-                if let Err(error) = writeln!(guard.file, "{line}").and_then(|_| guard.file.flush())
-                {
-                    tracing::error!(%error, "failed to append to the audit log");
-                }
-            }
-            Err(error) => tracing::error!(%error, "failed to serialise an audit event"),
-        }
+        let line = serde_json::to_string(&event).context("serialising an audit event")?;
+        writeln!(guard.file, "{line}")
+            .and_then(|_| guard.file.flush())
+            .inspect_err(|error| tracing::error!(%error, "failed to append to the audit log"))
+            .context("appending to the audit log")?;
 
         guard.seq += 1;
         guard.prev_hash = event.hash.clone();
@@ -217,7 +222,20 @@ impl AuditLog {
             tracing::info!("{}", event.oneline());
         }
         let _ = self.events.send(event.clone());
-        event
+        Ok(event)
+    }
+
+    /// Append a record where the caller has already decided to refuse, or is
+    /// past the point of being able to. Denials and shutdown notes still belong
+    /// in the log, but failing to record one must not turn a `deny` into a 500.
+    pub fn write_best_effort(&self, record: AuditRecord) -> Option<AuditEvent> {
+        match self.write(record) {
+            Ok(event) => Some(event),
+            Err(error) => {
+                tracing::error!(?error, "an audit record was lost");
+                None
+            }
+        }
     }
 
     /// Replace credential-bearing header values with `***`.
@@ -352,7 +370,7 @@ mod tests {
         for index in 0..3 {
             let mut record = AuditRecord::new("http", "request");
             record.agent = format!("agent-{index}");
-            log.write(record);
+            log.write(record).unwrap();
         }
         drop(log);
 
@@ -360,7 +378,7 @@ mod tests {
 
         // Reopening must continue the chain rather than restart it.
         let (log, _) = log_in(dir.path());
-        log.write(AuditRecord::new("mcp", "request"));
+        log.write(AuditRecord::new("mcp", "request")).unwrap();
         drop(log);
         assert_eq!(verify_file(&path).unwrap().entries, 4);
     }
@@ -371,8 +389,8 @@ mod tests {
         let (log, path) = log_in(dir.path());
         let mut record = AuditRecord::new("http", "request");
         record.decision = Some("deny".into());
-        log.write(record);
-        log.write(AuditRecord::new("http", "request"));
+        log.write(record).unwrap();
+        log.write(AuditRecord::new("http", "request")).unwrap();
         drop(log);
 
         let text = std::fs::read_to_string(&path).unwrap();
@@ -387,7 +405,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (log, path) = log_in(dir.path());
         for _ in 0..3 {
-            log.write(AuditRecord::new("http", "request"));
+            log.write(AuditRecord::new("http", "request")).unwrap();
         }
         drop(log);
 
@@ -402,6 +420,46 @@ mod tests {
 
         let err = verify_file(&path).unwrap_err().to_string();
         assert!(err.contains("sequence gap"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_write_does_not_advance_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, path) = log_in(dir.path());
+        log.write(AuditRecord::new("http", "request")).unwrap();
+
+        // Make the next append fail the way a full or read-only disk would.
+        {
+            let mut guard = log.inner.lock();
+            guard.file = BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .open(dir.path().join("audit.jsonl"))
+                    .unwrap(),
+            );
+        }
+        assert!(
+            log.write(AuditRecord::new("http", "request")).is_err(),
+            "an unwritable log must report failure, not swallow it"
+        );
+
+        // Restore a working handle and carry on.
+        {
+            let mut guard = log.inner.lock();
+            guard.file = BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+            );
+        }
+        log.write(AuditRecord::new("http", "request")).unwrap();
+        drop(log);
+
+        // Two entries reached the file, and the chain over them is intact — the
+        // lost record must not leave a gap that reads as tampering.
+        let report = verify_file(&path).unwrap();
+        assert_eq!(report.entries, 2);
     }
 
     #[test]

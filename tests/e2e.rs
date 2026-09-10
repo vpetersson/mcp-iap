@@ -57,6 +57,17 @@ struct Harness {
 
 async fn spawn_proxy(extra_acl: &str) -> Harness {
     let upstream = spawn_upstream().await;
+    build_harness(&format!("http://{upstream}"), DEFAULT_AUTH, extra_acl).await
+}
+
+const DEFAULT_AUTH: &str =
+    r#"{ type = "header", header = "x-api-key", secret = "literal:sk-upstream-real" }"#;
+
+async fn spawn_proxy_with_upstream(base_url: &str, auth: &str) -> Harness {
+    build_harness(base_url, auth, "").await
+}
+
+async fn build_harness(upstream: &str, auth: &str, extra_acl: &str) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let audit_path = dir.path().join("audit.jsonl");
 
@@ -78,8 +89,8 @@ targets = ["echo", "notes"]
 
 [[upstreams]]
 name = "echo"
-base_url = "http://{upstream}"
-auth = {{ type = "header", header = "x-api-key", secret = "literal:{key}" }}
+base_url = "{upstream}"
+auth = {auth}
 
 [[mcp_servers]]
 name = "notes"
@@ -103,13 +114,13 @@ action = "allow"
         audit = audit_path.display(),
         token_hash = mcp_iap::identity::token_hash(AGENT_TOKEN),
         upstream = upstream,
-        key = UPSTREAM_KEY,
+        auth = auth,
     );
 
     let config: Config = toml::from_str(&config_text).unwrap();
     config.validate().unwrap();
     let state = AppState::build(config, false).unwrap();
-    state.log_startup();
+    state.log_startup().unwrap();
 
     let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = proxy_listener.local_addr().unwrap();
@@ -267,6 +278,82 @@ async fn anything_the_policy_does_not_allow_is_denied() {
     let raw = raw_request(harness.proxy, "GET /echo/v1/../../admin HTTP/1.1").await;
     assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
     assert!(raw.contains("invalid_path"), "{raw}");
+}
+
+#[tokio::test]
+async fn an_encoded_traversal_cannot_escape_the_path_the_policy_approved() {
+    // A deliberately ordinary grant: everything under /v1 is allowed. Before the
+    // fix that was enough — the encoded climb matched this rule and then resolved
+    // out of /v1 entirely.
+    let harness = spawn_proxy(
+        r#"
+[[acl]]
+name = "all-of-v1"
+target = "echo"
+methods = ["GET"]
+paths = ["/v1/**"]
+action = "allow"
+"#,
+    )
+    .await;
+
+    // `%2e%2e` is `..` to a URL parser and to nothing else. It once passed the
+    // traversal guard, matched `paths = ["/v1/models"]`, and then resolved to
+    // `/admin/keys` on the way out — with the credential attached.
+    for attempt in [
+        "GET /echo/v1/%2e%2e/%2e%2e/admin/keys HTTP/1.1",
+        "GET /echo/v1/%2E%2E/admin/keys HTTP/1.1",
+        "GET /echo/v1/%2e%2e%2f%2e%2e%2fadmin/keys HTTP/1.1",
+        "GET /echo/v1/..%2fadmin/keys HTTP/1.1",
+        "GET /echo/v1/%5c..%5cadmin/keys HTTP/1.1",
+    ] {
+        let raw = raw_request(harness.proxy, attempt).await;
+        let status = raw.lines().next().unwrap_or_default().to_string();
+        assert!(
+            status.starts_with("HTTP/1.1 400"),
+            "`{attempt}` was not refused — got `{status}`"
+        );
+        assert!(
+            !raw.contains(UPSTREAM_KEY),
+            "`{attempt}` reached the upstream with the credential"
+        );
+    }
+
+    // The ordinary encoded characters people legitimately send still work.
+    let ok = client()
+        .get(format!("http://{}/echo/v1/models", harness.proxy))
+        .bearer_auth(AGENT_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+}
+
+#[tokio::test]
+async fn a_query_string_credential_never_reaches_the_audit_log() {
+    // The upstream is a closed port, so the request fails and the failure is
+    // recorded. reqwest's own error text embeds the post-injection URL.
+    let harness = spawn_proxy_with_upstream(
+        "http://127.0.0.1:1",
+        r#"{ type = "query", param = "key", secret = "literal:sk-query-secret" }"#,
+    )
+    .await;
+
+    let response = client()
+        .get(format!("http://{}/echo/v1/models", harness.proxy))
+        .bearer_auth(AGENT_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+
+    let log = std::fs::read_to_string(&harness.audit_path).unwrap();
+    assert!(
+        !log.contains("sk-query-secret"),
+        "the injected credential was written to the audit log:\n{log}"
+    );
+    // The failure is still described, just without the request in it.
+    assert!(log.contains("could not connect to the upstream"), "{log}");
 }
 
 /// Send a request line verbatim, bypassing client-side URL normalisation.

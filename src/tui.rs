@@ -378,18 +378,23 @@ action = "ask"
         }];
 
         let mut feed = VecDeque::new();
-        feed.push_back(state.audit.write(crate::audit::AuditRecord {
-            kind: "http".into(),
-            event: "request".into(),
-            agent: "claude-code".into(),
-            target: "github".into(),
-            method: "GET".into(),
-            path: "/repos/acme/api".into(),
-            decision: Some("allow".into()),
-            rule: Some("github-reads".into()),
-            status: Some(200),
-            ..Default::default()
-        }));
+        feed.push_back(
+            state
+                .audit
+                .write(crate::audit::AuditRecord {
+                    kind: "http".into(),
+                    event: "request".into(),
+                    agent: "claude-code".into(),
+                    target: "github".into(),
+                    method: "GET".into(),
+                    path: "/repos/acme/api".into(),
+                    decision: Some("allow".into()),
+                    rule: Some("github-reads".into()),
+                    status: Some(200),
+                    ..Default::default()
+                })
+                .unwrap(),
+        );
 
         let mut list_state = ListState::default();
         list_state.select(Some(0));

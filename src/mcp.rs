@@ -16,6 +16,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+/// The agent's stdin/stdout is a single JSON-RPC stream, so every writer has to
+/// go through one handle. Two `tokio::io::stdout()` handles buffer separately
+/// and can interleave halves of two frames.
+type SharedStdout = Arc<Mutex<tokio::io::Stdout>>;
+
 use crate::admin::AuthorizeResult;
 use crate::config::{Config, McpServerConfig, McpTransportKind};
 use crate::credentials::CredentialInjector;
@@ -127,6 +132,38 @@ impl Authorizer {
         Ok(())
     }
 
+    /// Open the session: authenticates the agent token and checks its `targets`,
+    /// and writes the `session_start` record. Any failure is fatal to the bridge.
+    async fn start_session(&self) -> Result<()> {
+        let response = self
+            .http
+            .post(format!("{}/event", self.admin_url))
+            .bearer_auth(&self.token)
+            .json(&json!({
+                "kind": "mcp",
+                "event": "session_start",
+                "target": self.server,
+            }))
+            .send()
+            .await
+            .context("opening an MCP session with the daemon")?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            bail!("the agent token was not recognised");
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            bail!(
+                "this agent may not address the MCP server `{}`",
+                self.server
+            );
+        }
+        if !status.is_success() {
+            bail!("the daemon answered the session request with {status}");
+        }
+        Ok(())
+    }
+
     async fn event(&self, event: &str, error: Option<String>, detail: Option<Value>) {
         let body = json!({
             "kind": "mcp",
@@ -193,20 +230,30 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
     // up in the audit log as a call the agent did not make.
     authorizer.probe().await?;
 
+    // Then prove *this* agent may address *this* server, before a single secret
+    // is resolved. The bridge used to spawn the real server — credentials and
+    // all — on the strength of an unauthenticated health check, so an unknown
+    // token materialised the key first and was rejected afterwards.
+    authorizer
+        .start_session()
+        .await
+        .context("the daemon refused this agent's MCP session")?;
+
     let resolver = Arc::new(SecretResolver::new(config.server.op_binary.clone()));
     // No audit log here: the bridge's records go to the daemon, which owns the log.
     let injector = CredentialInjector::new(Arc::clone(&resolver), reqwest::Client::new(), None);
 
-    let mut stdout = tokio::io::stdout();
+    let stdout: SharedStdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut relay = None;
     let upstream = match server.transport {
         McpTransportKind::Stdio => {
             let (upstream, child_stdout) = spawn_stdio(&server, &injector)?;
             // Relay everything the real server says straight back to the agent.
+            let out = Arc::clone(&stdout);
             relay = Some(tokio::spawn(async move {
                 let mut lines = BufReader::new(child_stdout).lines();
-                let mut out = tokio::io::stdout();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    let mut out = out.lock().await;
                     if out
                         .write_all(format!("{line}\n").as_bytes())
                         .await
@@ -231,8 +278,6 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
         })),
     };
 
-    authorizer.event("session_start", None, None).await;
-
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -243,7 +288,7 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
             continue;
         };
 
-        if !authorize_message(&authorizer, &message, &mut stdout).await? {
+        if !authorize_message(&authorizer, &message, &stdout).await? {
             continue;
         }
 
@@ -255,12 +300,12 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
                 }
             }
             Upstream::Http(http) => {
-                if let Err(error) = relay_http(http, &message, &mut stdout).await {
+                if let Err(error) = relay_http(http, &message, &stdout).await {
                     authorizer
                         .event("error", Some(error.to_string()), None)
                         .await;
                     if let Some(response) = blocked_response(&message, &error.to_string()) {
-                        write_message(&mut stdout, &response).await?;
+                        write_message(&stdout, &response).await?;
                     }
                 }
             }
@@ -285,7 +330,7 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
 async fn authorize_message(
     authorizer: &Authorizer,
     message: &Value,
-    stdout: &mut tokio::io::Stdout,
+    stdout: &SharedStdout,
 ) -> Result<bool> {
     // A batch is all-or-nothing: partially forwarding one would desynchronise
     // the ids the agent is waiting on.
@@ -297,10 +342,15 @@ async fn authorize_message(
             let result = authorizer.authorize(&method, &name).await;
             if !result.allowed {
                 let reason = result.reason.unwrap_or_else(|| result.decision.clone());
-                for element in batch {
-                    if let Some(response) = blocked_response(element, &reason) {
-                        write_message(stdout, &response).await?;
-                    }
+                // One array, not N loose objects: a batch request takes a batch
+                // response, and anything else desynchronises the very ids the
+                // all-or-nothing rule exists to keep straight.
+                let refusals: Vec<Value> = batch
+                    .iter()
+                    .filter_map(|element| blocked_response(element, &reason))
+                    .collect();
+                if !refusals.is_empty() {
+                    write_message(stdout, &Value::Array(refusals)).await?;
                 }
                 return Ok(false);
             }
@@ -324,11 +374,11 @@ async fn authorize_message(
     Ok(false)
 }
 
-async fn write_message(stdout: &mut tokio::io::Stdout, message: &Value) -> Result<()> {
-    stdout
-        .write_all(format!("{}\n", serde_json::to_string(message)?).as_bytes())
-        .await?;
-    stdout.flush().await?;
+async fn write_message(stdout: &SharedStdout, message: &Value) -> Result<()> {
+    let line = format!("{}\n", serde_json::to_string(message)?);
+    let mut out = stdout.lock().await;
+    out.write_all(line.as_bytes()).await?;
+    out.flush().await?;
     Ok(())
 }
 
@@ -371,11 +421,7 @@ fn spawn_stdio(
     ))
 }
 
-async fn relay_http(
-    upstream: &HttpUpstream,
-    message: &Value,
-    stdout: &mut tokio::io::Stdout,
-) -> Result<()> {
+async fn relay_http(upstream: &HttpUpstream, message: &Value, stdout: &SharedStdout) -> Result<()> {
     let mut request = reqwest::Request::new(
         http::Method::POST,
         upstream.url.parse().context("parsing the MCP server url")?,

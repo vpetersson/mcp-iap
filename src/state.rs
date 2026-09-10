@@ -41,7 +41,13 @@ impl AppState {
         let audit = Arc::new(AuditLog::open(&config.audit, audit_to_stderr)?);
 
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(config.server.upstream_timeout_secs))
+            // `read_timeout` bounds the gap between chunks; `timeout` would bound
+            // the whole response, silently truncating any stream that ran longer
+            // than it — which for streamed LLM output is the normal case.
+            .read_timeout(Duration::from_secs(config.server.upstream_timeout_secs))
+            .connect_timeout(Duration::from_secs(
+                config.server.upstream_connect_timeout_secs,
+            ))
             .user_agent(concat!("mcp-iap/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("building the upstream HTTP client")?;
@@ -87,7 +93,10 @@ impl AppState {
     }
 
     /// Record that the proxy came up, so every log begins with its own provenance.
-    pub fn log_startup(&self) {
+    ///
+    /// Fallible: a proxy that cannot write its own startup line will not be able
+    /// to record anything it allows either, and should not come up at all.
+    pub fn log_startup(&self) -> Result<()> {
         let mut record = AuditRecord::new("proxy", "startup");
         record.target = self.config.server.listen.to_string();
         record.detail = Some(serde_json::json!({
@@ -98,6 +107,9 @@ impl AppState {
             "acl_rules": self.acl.rule_count(),
             "acl_default": self.acl.default_action().to_string(),
         }));
-        self.audit.write(record);
+        self.audit
+            .write(record)
+            .context("writing the first audit record — is the log path writable?")?;
+        Ok(())
     }
 }
