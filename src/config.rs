@@ -217,6 +217,39 @@ pub enum AuthConfig {
         #[serde(default)]
         audience: Option<String>,
     },
+    /// Service account → short-lived access token (RFC 7523), the flow Google uses.
+    ///
+    /// The proxy signs a JWT with the account's private key, exchanges it for an
+    /// access token, and injects the token. The key never leaves this process and
+    /// the agent never sees either one.
+    ServiceAccountJwt {
+        /// Secret reference to a Google-style service-account JSON key. Supplies
+        /// the issuer, key id and token endpoint on its own.
+        #[serde(default)]
+        key_file: Option<String>,
+        /// Or spell the pieces out, for any other RFC 7523 provider.
+        #[serde(default)]
+        issuer: Option<String>,
+        /// Secret reference to a PKCS#8 PEM private key.
+        #[serde(default)]
+        private_key: Option<String>,
+        #[serde(default)]
+        key_id: Option<String>,
+        #[serde(default)]
+        token_url: Option<String>,
+        /// The `aud` claim. Defaults to `token_url`, which is what Google wants.
+        #[serde(default)]
+        audience: Option<String>,
+        /// Requested scopes, sent as one space-delimited `scope` claim.
+        #[serde(default)]
+        scopes: Vec<String>,
+        /// Impersonate this user (Google domain-wide delegation).
+        #[serde(default)]
+        subject: Option<String>,
+        /// Assertion lifetime. Clamped to one hour, which is Google's ceiling.
+        #[serde(default)]
+        lifetime_secs: Option<u64>,
+    },
 }
 
 impl AuthConfig {
@@ -231,7 +264,25 @@ impl AuthConfig {
             AuthConfig::Oauth2ClientCredentials { client_secret, .. } => {
                 vec![client_secret.as_str()]
             }
+            AuthConfig::ServiceAccountJwt {
+                key_file,
+                private_key,
+                ..
+            } => key_file
+                .iter()
+                .chain(private_key.iter())
+                .map(String::as_str)
+                .collect(),
         }
+    }
+
+    /// True for schemes where the proxy mints a short-lived token of its own
+    /// rather than forwarding a long-lived secret.
+    pub fn mints_tokens(&self) -> bool {
+        matches!(
+            self,
+            AuthConfig::Oauth2ClientCredentials { .. } | AuthConfig::ServiceAccountJwt { .. }
+        )
     }
 }
 
@@ -492,6 +543,46 @@ fn check_auth(auth: &AuthConfig, label: &str) -> Result<()> {
     if let AuthConfig::Oauth2ClientCredentials { token_url, .. } = auth {
         url::Url::parse(token_url).with_context(|| format!("{label}: token_url"))?;
     }
+
+    if let AuthConfig::ServiceAccountJwt {
+        key_file,
+        issuer,
+        private_key,
+        token_url,
+        audience,
+        ..
+    } = auth
+    {
+        // Either a Google JSON key, or the pieces spelled out — never a mixture,
+        // because then it is ambiguous which issuer or key actually applies.
+        match (key_file, private_key) {
+            (Some(_), Some(_)) => bail!(
+                "{label}: set either `key_file` or `private_key`, not both"
+            ),
+            (None, None) => bail!(
+                "{label}: a service-account credential needs `key_file`                  (a Google JSON key) or `private_key` plus `issuer` and `token_url`"
+            ),
+            (Some(_), None) => {
+                if issuer.is_some() {
+                    bail!("{label}: `issuer` comes from the key file; remove it or use `private_key` instead");
+                }
+            }
+            (None, Some(_)) => {
+                if issuer.is_none() {
+                    bail!("{label}: `private_key` also needs `issuer`");
+                }
+                if token_url.is_none() {
+                    bail!("{label}: `private_key` also needs `token_url`");
+                }
+            }
+        }
+        for (field, value) in [("token_url", token_url), ("audience", audience)] {
+            if let Some(value) = value {
+                url::Url::parse(value).with_context(|| format!("{label}: {field}"))?;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -550,6 +641,77 @@ action = "allow"
         let mut config: Config = toml::from_str(&text).unwrap();
         config.agents[0].targets = vec!["typo".into()];
         assert!(config.validate().unwrap_err().to_string().contains("typo"));
+    }
+
+    /// The shipped example is documentation people copy, so it has to be real.
+    #[test]
+    fn the_example_config_parses_and_validates() {
+        let text = include_str!("../iap.example.toml");
+        let config: Config = toml::from_str(text).expect("iap.example.toml must parse");
+        config.validate().expect("iap.example.toml must validate");
+
+        assert!(
+            config
+                .upstreams
+                .iter()
+                .any(|u| matches!(u.auth, AuthConfig::ServiceAccountJwt { .. })),
+            "the example should demonstrate a service account"
+        );
+        for reference in config.secret_refs() {
+            SecretRef::parse(&reference).expect("every example secret reference must parse");
+        }
+    }
+
+    #[test]
+    fn a_service_account_needs_exactly_one_source_of_key_material() {
+        let base = r#"
+[[upstreams]]
+name = "gcs"
+base_url = "https://storage.googleapis.com"
+[upstreams.auth]
+type = "service_account_jwt"
+"#;
+        let both = format!(
+            "{base}key_file = \"env:SA\"\nprivate_key = \"env:PEM\"\nissuer = \"a@b\"\ntoken_url = \"https://x/token\"\n"
+        );
+        assert!(toml::from_str::<Config>(&both)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not both"));
+
+        assert!(toml::from_str::<Config>(base)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("needs `key_file`"));
+
+        let no_issuer =
+            format!("{base}private_key = \"env:PEM\"\ntoken_url = \"https://x/token\"\n");
+        assert!(toml::from_str::<Config>(&no_issuer)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("needs `issuer`"));
+
+        let no_token_url = format!("{base}private_key = \"env:PEM\"\nissuer = \"a@b\"\n");
+        assert!(toml::from_str::<Config>(&no_token_url)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("needs `token_url`"));
+
+        let key_file_only = format!("{base}key_file = \"env:SA\"\n");
+        let config = toml::from_str::<Config>(&key_file_only).unwrap();
+        config
+            .validate()
+            .expect("a bare key_file is the Google case");
+        assert_eq!(config.secret_refs(), vec!["env:SA"]);
+        assert!(config.upstreams[0].auth.mints_tokens());
     }
 
     #[test]

@@ -10,25 +10,54 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::audit::{AuditLog, AuditRecord};
 use crate::config::AuthConfig;
 use crate::secrets::{Secret, SecretResolver};
+use crate::service_account::{ServiceAccount, JWT_BEARER_GRANT};
 
-/// Refresh an OAuth token this long before it actually expires.
-const OAUTH_REFRESH_MARGIN: Duration = Duration::from_secs(60);
+/// Refresh a minted token this long before it actually expires.
+const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
+
+/// Assume this lifetime when a provider returns a token without `expires_in`.
+const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
 
 pub struct CredentialInjector {
     resolver: Arc<SecretResolver>,
     http: reqwest::Client,
-    oauth_cache: Mutex<HashMap<String, (Secret, Instant)>>,
+    token_cache: Mutex<HashMap<String, (Secret, Instant)>>,
+    /// One in-flight token request per target, so a burst of requests on a cold
+    /// cache mints one token rather than one each.
+    token_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Service-account keys, parsed once at startup.
+    service_accounts: Mutex<HashMap<String, Arc<ServiceAccount>>>,
+    /// Minting a token is a security event in its own right; when the injector
+    /// has a log, every mint is recorded (never the token).
+    audit: Option<Arc<AuditLog>>,
 }
 
 impl CredentialInjector {
-    pub fn new(resolver: Arc<SecretResolver>, http: reqwest::Client) -> Self {
+    pub fn new(
+        resolver: Arc<SecretResolver>,
+        http: reqwest::Client,
+        audit: Option<Arc<AuditLog>>,
+    ) -> Self {
         CredentialInjector {
             resolver,
             http,
-            oauth_cache: Mutex::new(HashMap::new()),
+            token_cache: Mutex::new(HashMap::new()),
+            token_gates: Mutex::new(HashMap::new()),
+            service_accounts: Mutex::new(HashMap::new()),
+            audit,
         }
+    }
+
+    /// Parse a target's service-account key now, so a malformed key or a locked
+    /// vault stops startup instead of surfacing as a 502 on the first request.
+    pub fn warm(&self, target: &str, auth: &AuthConfig) -> Result<()> {
+        if matches!(auth, AuthConfig::ServiceAccountJwt { .. }) {
+            self.service_account(target, auth)?;
+        }
+        Ok(())
     }
 
     /// Mutate an outbound request so it carries the upstream's real credential.
@@ -73,8 +102,8 @@ impl CredentialInjector {
                     .query_pairs_mut()
                     .append_pair(param, value.expose());
             }
-            AuthConfig::Oauth2ClientCredentials { .. } => {
-                let token = self.oauth_token(target, auth).await?;
+            AuthConfig::Oauth2ClientCredentials { .. } | AuthConfig::ServiceAccountJwt { .. } => {
+                let token = self.minted_token(target, auth).await?;
                 set_header(
                     request,
                     "authorization",
@@ -104,7 +133,89 @@ impl CredentialInjector {
         self.resolver.resolve(reference)
     }
 
-    async fn oauth_token(&self, target: &str, auth: &AuthConfig) -> Result<Secret> {
+    /// A short-lived token the proxy mints itself, cached until it is nearly due
+    /// to expire. Both minting schemes share this path.
+    async fn minted_token(&self, target: &str, auth: &AuthConfig) -> Result<Secret> {
+        if let Some(token) = self.cached_token(target) {
+            return Ok(token);
+        }
+
+        // Serialise per target. Whoever gets here first mints; the rest wait and
+        // then find the fresh token in the cache.
+        let gate = self.gate(target);
+        let _held = gate.lock().await;
+        if let Some(token) = self.cached_token(target) {
+            return Ok(token);
+        }
+
+        let (token, lifetime, detail) = match auth {
+            AuthConfig::Oauth2ClientCredentials { .. } => {
+                self.fetch_client_credentials(target, auth).await?
+            }
+            AuthConfig::ServiceAccountJwt { .. } => {
+                self.fetch_service_account_token(target, auth).await?
+            }
+            _ => unreachable!("minted_token is only called for token-minting schemes"),
+        };
+        let token_url = detail
+            .get("token_url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        self.token_cache.lock().insert(
+            target.to_string(),
+            (token.clone(), Instant::now() + lifetime),
+        );
+
+        if let Some(audit) = &self.audit {
+            let mut record = AuditRecord::new("credential", "token_minted");
+            record.agent = "<proxy>".into();
+            record.target = target.to_string();
+            record.method = "POST".into();
+            record.path = token_url;
+            record.detail = Some(detail);
+            audit.write(record);
+        }
+
+        Ok(token)
+    }
+
+    fn cached_token(&self, target: &str) -> Option<Secret> {
+        let cache = self.token_cache.lock();
+        let (token, expires_at) = cache.get(target)?;
+        (Instant::now() + TOKEN_REFRESH_MARGIN < *expires_at).then(|| token.clone())
+    }
+
+    fn gate(&self, target: &str) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.token_gates
+                .lock()
+                .entry(target.to_string())
+                .or_default(),
+        )
+    }
+
+    /// Load (and remember) a target's service-account key.
+    fn service_account(&self, target: &str, auth: &AuthConfig) -> Result<Arc<ServiceAccount>> {
+        if let Some(account) = self.service_accounts.lock().get(target) {
+            return Ok(Arc::clone(account));
+        }
+        let account = Arc::new(
+            ServiceAccount::load(auth, &self.resolver)
+                .with_context(|| format!("loading the service-account key for `{target}`"))?,
+        );
+        self.service_accounts
+            .lock()
+            .insert(target.to_string(), Arc::clone(&account));
+        Ok(account)
+    }
+
+    async fn fetch_client_credentials(
+        &self,
+        target: &str,
+        auth: &AuthConfig,
+    ) -> Result<(Secret, Duration, serde_json::Value)> {
         let AuthConfig::Oauth2ClientCredentials {
             token_url,
             client_id,
@@ -113,14 +224,8 @@ impl CredentialInjector {
             audience,
         } = auth
         else {
-            unreachable!("oauth_token is only called for the client-credentials scheme");
+            unreachable!("only called for the client-credentials scheme");
         };
-
-        if let Some((token, expires_at)) = self.oauth_cache.lock().get(target) {
-            if Instant::now() + OAUTH_REFRESH_MARGIN < *expires_at {
-                return Ok(token.clone());
-            }
-        }
 
         let secret = self.resolve(client_secret)?;
         let mut form = vec![
@@ -135,19 +240,72 @@ impl CredentialInjector {
             form.push(("audience", audience.clone()));
         }
 
+        let (token, lifetime) = self.exchange(target, token_url, &form).await?;
+        Ok((
+            token,
+            lifetime,
+            serde_json::json!({
+                "scheme": "oauth2_client_credentials",
+                "token_url": token_url,
+                "client_id": client_id,
+                "expires_in_secs": lifetime.as_secs(),
+            }),
+        ))
+    }
+
+    /// Sign an assertion with the service-account key and trade it for a token.
+    async fn fetch_service_account_token(
+        &self,
+        target: &str,
+        auth: &AuthConfig,
+    ) -> Result<(Secret, Duration, serde_json::Value)> {
+        let account = self.service_account(target, auth)?;
+        let assertion = account
+            .assertion()
+            .with_context(|| format!("signing a service-account assertion for `{target}`"))?;
+
+        let form = vec![
+            ("grant_type", JWT_BEARER_GRANT.to_string()),
+            ("assertion", assertion),
+        ];
+
+        let (token, lifetime) = self.exchange(target, account.token_url(), &form).await?;
+        Ok((
+            token,
+            lifetime,
+            serde_json::json!({
+                "scheme": "service_account_jwt",
+                "token_url": account.token_url(),
+                "issuer": account.issuer(),
+                "subject": account.subject(),
+                "scopes": account.scopes(),
+                "assertion_lifetime_secs": account.lifetime().as_secs(),
+                "expires_in_secs": lifetime.as_secs(),
+            }),
+        ))
+    }
+
+    /// POST a token request and read the access token out of the response.
+    async fn exchange(
+        &self,
+        target: &str,
+        token_url: &str,
+        form: &[(&str, String)],
+    ) -> Result<(Secret, Duration)> {
         let response = self
             .http
             .post(token_url)
-            .form(&form)
+            .form(form)
             .send()
             .await
-            .with_context(|| format!("requesting an OAuth token for `{target}`"))?;
+            .with_context(|| format!("requesting a token for `{target}`"))?;
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            // The body of a failed token request can echo the client secret back.
-            anyhow::bail!("OAuth token request for `{target}` failed with {status}");
+            // A failed token request can echo the credential back in its body,
+            // and providers put useful-but-sensitive detail in `error_description`.
+            anyhow::bail!("token request for `{target}` failed with {status}");
         }
 
         #[derive(serde::Deserialize)]
@@ -157,15 +315,13 @@ impl CredentialInjector {
             expires_in: Option<u64>,
         }
         let parsed: TokenResponse = serde_json::from_str(&body)
-            .with_context(|| format!("parsing the OAuth token response for `{target}`"))?;
+            .with_context(|| format!("parsing the token response for `{target}`"))?;
 
-        let token = Secret::new(parsed.access_token);
-        let lifetime = Duration::from_secs(parsed.expires_in.unwrap_or(3600));
-        self.oauth_cache.lock().insert(
-            target.to_string(),
-            (token.clone(), Instant::now() + lifetime),
-        );
-        Ok(token)
+        let lifetime = parsed
+            .expires_in
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_TOKEN_LIFETIME);
+        Ok((Secret::new(parsed.access_token), lifetime))
     }
 }
 
@@ -188,7 +344,7 @@ mod tests {
     fn injector() -> CredentialInjector {
         let resolver = Arc::new(SecretResolver::new("op"));
         resolver.preset("literal:sk-real", Secret::new("sk-real".into()));
-        CredentialInjector::new(resolver, reqwest::Client::new())
+        CredentialInjector::new(resolver, reqwest::Client::new(), None)
     }
 
     fn request() -> reqwest::Request {

@@ -128,7 +128,52 @@ hard error — a typo must never quietly widen access.
 | `basic` | `Authorization: Basic base64(username:secret)` |
 | `query` | appends `?param=<secret>` |
 | `oauth2_client_credentials` | fetches and caches an access token, refreshed a minute before expiry |
+| `service_account_jwt` | signs a JWT with a service-account key and exchanges it for a short-lived token — see below |
 | `none` | pass through |
+
+The last two mint a token rather than forwarding a secret. Minted tokens are
+cached until a minute before they expire, and a burst of requests on a cold
+cache mints one token, not one each.
+
+### Service accounts (Google, and anything else doing RFC 7523)
+
+Google does not want you sending a service-account key to an API. It wants a
+JWT, signed with that key, exchanged at its token endpoint for an access token
+that lives an hour. The proxy does all of that — the agent never sees the key,
+and never sees the access token either.
+
+```toml
+[[upstreams]]
+name = "gcs"
+base_url = "https://storage.googleapis.com"
+
+[upstreams.auth]
+type = "service_account_jwt"
+key_file = "op://Private/GCP Service Account/credential"   # the JSON Google gave you
+scopes = ["https://www.googleapis.com/auth/devstorage.read_only"]
+# subject = "person@example.com"   # domain-wide delegation: act as this user
+```
+
+`key_file` points at the service-account JSON exactly as Google issues it; the
+issuer, key id and token endpoint all come from inside it. For any other
+provider that accepts a signed assertion, spell the pieces out instead:
+
+```toml
+[upstreams.auth]
+type = "service_account_jwt"
+issuer = "service@example.com"
+private_key = "file:/run/secrets/service-account.pk8.pem"   # PKCS#8 PEM
+token_url = "https://auth.example.com/oauth/token"
+audience = "https://api.example.com"    # defaults to token_url, which is what Google wants
+scopes = ["read:data"]
+lifetime_secs = 3600                    # clamped to an hour, Google's ceiling
+```
+
+The key is parsed at startup, so a malformed or passphrase-encrypted key stops
+the process with a message naming the problem rather than turning into a 502 on
+the first call. PKCS#1 keys (`BEGIN RSA PRIVATE KEY`) are rejected with the
+`openssl` command that converts them. Every mint is recorded in the audit log
+with the issuer, scopes and expiry — never the token.
 
 ### Where secrets come from
 
@@ -247,12 +292,14 @@ Rate limits and spend caps per agent; hot config reload; a decoupled TUI that
 attaches to an already-running daemon over the control plane; SSE streaming for
 the HTTP MCP transport (single JSON responses work, `data:` frames are parsed,
 long-lived streams are not); mTLS agent identity; native 1Password Connect
-(the CLI is shelled out to today).
+(the CLI is shelled out to today). On service accounts specifically: only RSA
+keys are supported (Google issues RS256 keys, so this covers Google), and the
+GCP metadata server and workload identity federation are not wired up.
 
 ## Development
 
 ```bash
-cargo test        # 64 tests: unit + end-to-end through a real proxy
+cargo test        # 83 tests: unit + end-to-end through a real proxy
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

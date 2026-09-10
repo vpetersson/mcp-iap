@@ -15,5 +15,6 @@ pub mod identity;
 pub mod mcp;
 pub mod proxy;
 pub mod secrets;
+pub mod service_account;
 pub mod state;
 pub mod tui;
