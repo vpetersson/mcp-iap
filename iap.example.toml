@@ -27,8 +27,9 @@ redact_headers = ["authorization", "x-api-key", "cookie", "x-iap-token"]
 [[agents]]
 id = "claude-code"
 name = "Claude Code"
-token_sha256 = "REPLACE_ME_WITH_THE_OUTPUT_OF_gen-token"
-targets = ["anthropic", "github", "github-mcp"]
+# Replace with the hash printed by `mcp-iap gen-token claude-code`.
+token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+targets = ["anthropic", "github", "gcs", "github-mcp"]
 
 # --- what they may reach ---------------------------------------------------
 # The agent calls http://127.0.0.1:8080/<name>/<path>; the proxy strips the
@@ -45,6 +46,21 @@ name = "github"
 base_url = "https://api.github.com"
 auth = { type = "bearer", secret = "op://Private/GitHub/token" }
 
+# A Google service account. The proxy signs a JWT with the account's key,
+# exchanges it at Google's token endpoint for an access token that lives an
+# hour, and injects that. The agent sees neither the key nor the token.
+
+[[upstreams]]
+name = "gcs"
+base_url = "https://storage.googleapis.com"
+
+[upstreams.auth]
+type = "service_account_jwt"
+key_file = "op://Private/GCP Service Account/credential"   # the JSON Google issued
+scopes = ["https://www.googleapis.com/auth/devstorage.read_only"]
+# subject = "person@example.com"   # domain-wide delegation: act as this user
+# lifetime_secs = 3600             # assertion lifetime, clamped to Google's one-hour ceiling
+
 # Other supported schemes:
 #   auth = { type = "basic", username = "user", secret = "env:PASSWORD" }
 #   auth = { type = "query", param = "key", secret = "file:/run/secrets/key" }
@@ -52,6 +68,16 @@ auth = { type = "bearer", secret = "op://Private/GitHub/token" }
 #            client_id = "abc", client_secret = "op://Private/IdP/client_secret",
 #            scope = "read:data" }
 #   auth = { type = "none" }
+#
+# Any other RFC 7523 provider, with the pieces spelled out instead of a Google
+# key file:
+#   [upstreams.auth]
+#   type = "service_account_jwt"
+#   issuer = "service@example.com"
+#   private_key = "file:/run/secrets/service-account.pk8.pem"   # PKCS#8 PEM
+#   token_url = "https://auth.example.com/oauth/token"
+#   audience = "https://api.example.com"   # defaults to token_url
+#   scopes = ["read:data"]
 
 # --- MCP servers -----------------------------------------------------------
 # The agent runs `mcp-iap mcp --server github-mcp` as its MCP server. The real

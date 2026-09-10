@@ -194,7 +194,8 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
     authorizer.probe().await?;
 
     let resolver = Arc::new(SecretResolver::new(config.server.op_binary.clone()));
-    let injector = CredentialInjector::new(Arc::clone(&resolver), reqwest::Client::new());
+    // No audit log here: the bridge's records go to the daemon, which owns the log.
+    let injector = CredentialInjector::new(Arc::clone(&resolver), reqwest::Client::new(), None);
 
     let mut stdout = tokio::io::stdout();
     let mut relay = None;

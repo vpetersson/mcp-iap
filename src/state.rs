@@ -46,7 +46,20 @@ impl AppState {
             .build()
             .context("building the upstream HTTP client")?;
 
-        let injector = CredentialInjector::new(Arc::clone(&resolver), http.clone());
+        let injector = CredentialInjector::new(
+            Arc::clone(&resolver),
+            http.clone(),
+            Some(Arc::clone(&audit)),
+        );
+
+        // Parse every service-account key now. A malformed key should stop the
+        // process here, not turn into a 502 the first time an agent calls.
+        for upstream in &config.upstreams {
+            injector.warm(&upstream.name, &upstream.auth)?;
+        }
+        for server in &config.mcp_servers {
+            injector.warm(&server.name, &server.auth)?;
+        }
         let broker = Arc::new(ApprovalBroker::new(Duration::from_secs(
             config.server.approval_timeout_secs,
         )));
