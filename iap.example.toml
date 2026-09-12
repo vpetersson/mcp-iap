@@ -15,6 +15,20 @@ max_body_bytes = 10485760
 # op_binary = "op"               # 1Password CLI used for op:// references
 # admin_token = "env:IAP_ADMIN_TOKEN"  # otherwise generated and written to ./admin-token
 
+# Workload identity. The agent token above says *who* is calling; it is
+# long-lived and identical for every call that agent ever makes. A workload
+# token says what one run is for and until when: the agent exchanges its token
+# at POST /_iap/token for a JWT this proxy signs, scoped to the requests it
+# named and expiring on its own.
+#
+#   off       agent tokens only, as before
+#   optional  both accepted — migrate with nothing breaking (the default)
+#   required  the data plane takes workload tokens only, and the agent token
+#             becomes a bootstrap credential that does nothing but mint one
+[server.workload_identity]
+mode = "optional"
+lifetime_secs = 3600             # ceiling as well as default; 60s–3600s
+
 [audit]
 path = "audit/iap-audit.jsonl"
 stderr = true

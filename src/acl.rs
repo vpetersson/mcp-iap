@@ -102,9 +102,21 @@ impl Decision {
 /// Some access requests have no path at all — `tools/list` names no tool. An
 /// empty path is "not applicable" rather than an empty string to glob against,
 /// so it is accepted only by a rule that places no constraint on the path.
-struct PathPattern {
+pub(crate) struct PathPattern {
     matcher: GlobMatcher,
     unconstrained: bool,
+}
+
+/// Whether a list of path patterns covers one path, with the empty-path rule.
+///
+/// Shared with workload scopes so a scope narrows a request the same way a rule
+/// matches one: two spellings of "does this pattern cover this path" that could
+/// drift apart is exactly the bug an IAP cannot afford.
+pub(crate) fn path_matches(patterns: &[PathPattern], path: &str) -> bool {
+    if path.is_empty() {
+        return patterns.iter().any(|p| p.unconstrained);
+    }
+    patterns.iter().any(|p| p.matcher.is_match(path))
 }
 
 struct CompiledRule {
@@ -131,10 +143,7 @@ impl CompiledRule {
     }
 
     fn matches_path(&self, path: &str) -> bool {
-        if path.is_empty() {
-            return self.paths.iter().any(|p| p.unconstrained);
-        }
-        self.paths.iter().any(|p| p.matcher.is_match(path))
+        path_matches(&self.paths, path)
     }
 }
 
@@ -247,7 +256,7 @@ fn compile_rule(index: usize, rule: &AclRuleConfig) -> Result<CompiledRule> {
 
 /// `*` matches anything, including `/`. Used for names and for JSON-RPC methods,
 /// which contain a separator of their own (`tools/call`).
-fn plain_glob(pattern: &str) -> Result<GlobMatcher> {
+pub(crate) fn plain_glob(pattern: &str) -> Result<GlobMatcher> {
     Ok(Glob::new(pattern)
         .with_context(|| format!("invalid pattern `{pattern}`"))?
         .compile_matcher())
@@ -255,7 +264,7 @@ fn plain_glob(pattern: &str) -> Result<GlobMatcher> {
 
 /// HTTP verbs are conventionally upper-case and JSON-RPC methods lower-case, and
 /// a JSON-RPC method carries its own separator (`tools/call`), so `*` spans `/`.
-fn method_glob(pattern: &str) -> Result<GlobMatcher> {
+pub(crate) fn method_glob(pattern: &str) -> Result<GlobMatcher> {
     Ok(globset::GlobBuilder::new(pattern)
         .case_insensitive(true)
         .build()
@@ -264,7 +273,7 @@ fn method_glob(pattern: &str) -> Result<GlobMatcher> {
 }
 
 /// `*` stops at `/`, `**` crosses it — the behaviour people expect from URL paths.
-fn path_glob(pattern: &str) -> Result<PathPattern> {
+pub(crate) fn path_glob(pattern: &str) -> Result<PathPattern> {
     Ok(PathPattern {
         matcher: globset::GlobBuilder::new(pattern)
             .literal_separator(true)

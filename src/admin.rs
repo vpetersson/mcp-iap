@@ -2,8 +2,10 @@
 //!
 //! Two audiences, two credentials. A human operator (the TUI, or curl) uses the
 //! admin token to see and answer the approval queue. The MCP bridge uses an
-//! *agent* token to ask this process — the single policy authority — whether a
-//! JSON-RPC call may proceed, so policy and audit never fork across processes.
+//! *agent* token — or a workload token minted from one, which is what it does
+//! when the policy file asks for it — to ask this process, the single policy
+//! authority, whether a JSON-RPC call may proceed, so policy and audit never
+//! fork across processes.
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -42,7 +44,13 @@ pub fn router(state: Arc<AppState>) -> Router {
     // their own check because the credential is a different one.
     let bridge = Router::new()
         .route("/authorize", post(authorize))
-        .route("/event", post(record_event));
+        .route("/event", post(record_event))
+        // The bridge only ever sees this listener, so the token endpoints have
+        // to be reachable here too or `required` mode would lock it out.
+        .merge(crate::tokens::routes(
+            crate::tokens::CONTROL_PREFIX,
+            state.clone(),
+        ));
 
     Router::new()
         .route("/health", get(health))
@@ -66,9 +74,18 @@ async fn require_admin(
 /// Unauthenticated on purpose: it exposes nothing but the fact that we are up,
 /// and the MCP bridge must be able to prove the policy authority exists before
 /// it accepts a single message from an agent.
-async fn health() -> Response {
-    Json(serde_json::json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
-        .into_response()
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    // The mode is here because the MCP bridge probes `/health` before it accepts
+    // a message, and that is the moment it needs to know whether to exchange its
+    // agent token for a workload one. Cheaper than a second round trip, and it
+    // discloses a posture rather than a secret.
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "workload_identity": state.workload.mode().as_str(),
+        "workload_lifetime_secs": state.workload.lifetime_secs(),
+    }))
+    .into_response()
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -114,6 +131,8 @@ struct StatusBody {
     pending: usize,
     remembered: usize,
     has_approver: bool,
+    workload_identity: &'static str,
+    workload_tokens: usize,
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Response {
@@ -128,6 +147,8 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
         pending: state.broker.pending_count(),
         remembered: state.broker.remembered_count(),
         has_approver: state.broker.has_approver(),
+        workload_identity: state.workload.mode().as_str(),
+        workload_tokens: state.workload.active_count(),
     })
     .into_response()
 }
@@ -213,9 +234,12 @@ async fn authorize(
     headers: HeaderMap,
     Json(body): Json<AuthorizeBody>,
 ) -> Response {
-    let Some(agent) = bearer(&headers).and_then(|token| state.agents.authenticate(token)) else {
-        return error(StatusCode::UNAUTHORIZED, "unknown agent token");
+    let caller = match bearer(&headers).map(|token| state.authenticate(token)) {
+        Some(Ok(caller)) => caller,
+        Some(Err(failure)) => return error(StatusCode::UNAUTHORIZED, &failure.message()),
+        None => return error(StatusCode::UNAUTHORIZED, "unknown agent token"),
     };
+    let agent = caller.agent();
 
     let access = AccessRequest {
         agent: agent.id.clone(),
@@ -228,12 +252,33 @@ async fn authorize(
     let mut record = AuditRecord::new(body.kind.as_str(), "request");
     record.agent = agent.id.clone();
     record.agent_name = Some(agent.display_name().to_string());
+    record.workload = caller.label();
     record.target = body.target.clone();
     record.method = body.method.clone();
     record.path = body.path.clone();
     record.detail = body.detail.clone();
 
-    if !agent_may_address(&agent, &body.target) {
+    // Same order as the proxy: what the credential covers, then what policy
+    // allows. A bridge asking about a tool its token was not minted for is
+    // refused here, before the ACL and before any credential is resolved.
+    if !caller.permits(&access) {
+        record.decision = Some("deny".into());
+        record.rule = Some("<workload-scope>".into());
+        state.audit.write_best_effort(record);
+        return Json(AuthorizeResult {
+            allowed: false,
+            decision: "deny".into(),
+            rule: "<workload-scope>".into(),
+            reason: Some(format!(
+                "the workload token does not cover `{}` on `{}`",
+                access.summary(),
+                body.target
+            )),
+        })
+        .into_response();
+    }
+
+    if !agent_may_address(agent, &body.target) {
         record.decision = Some("deny".into());
         record.rule = Some("<agent-targets>".into());
         state.audit.write_best_effort(record);
@@ -328,9 +373,12 @@ async fn record_event(
     headers: HeaderMap,
     Json(body): Json<EventBody>,
 ) -> Response {
-    let Some(agent) = bearer(&headers).and_then(|token| state.agents.authenticate(token)) else {
-        return error(StatusCode::UNAUTHORIZED, "unknown agent token");
+    let caller = match bearer(&headers).map(|token| state.authenticate(token)) {
+        Some(Ok(caller)) => caller,
+        Some(Err(failure)) => return error(StatusCode::UNAUTHORIZED, &failure.message()),
+        None => return error(StatusCode::UNAUTHORIZED, "unknown agent token"),
     };
+    let agent = caller.agent();
     if !DELEGATE_EVENTS.contains(&body.event.as_str()) {
         return error(
             StatusCode::BAD_REQUEST,
@@ -340,7 +388,7 @@ async fn record_event(
     // The MCP bridge calls this before it resolves any credential, so this is
     // where an agent reaching for a server it was never granted gets stopped —
     // ahead of the key existing in a process the agent controls.
-    if !body.target.is_empty() && !agent_may_address(&agent, &body.target) {
+    if !body.target.is_empty() && !agent_may_address(agent, &body.target) {
         return error(
             StatusCode::FORBIDDEN,
             "this agent may not address that target",
@@ -350,6 +398,7 @@ async fn record_event(
     let mut record = AuditRecord::new(body.kind.as_str(), &body.event);
     record.agent = agent.id.clone();
     record.agent_name = Some(agent.display_name().to_string());
+    record.workload = caller.label();
     record.target = body.target;
     record.method = body.method;
     record.path = body.path;

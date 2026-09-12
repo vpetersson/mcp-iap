@@ -21,4 +21,6 @@ pub mod proxy;
 pub mod secrets;
 pub mod service_account;
 pub mod state;
+pub mod tokens;
 pub mod tui;
+pub mod workload;

@@ -7,8 +7,15 @@
 //!
 //! Policy and audit stay in the daemon. If the daemon is unreachable the bridge
 //! refuses to start, and if an authorization call fails the call is denied.
+//!
+//! The bridge is itself a workload, and when the daemon asks for workload
+//! identity it behaves like one: it exchanges the agent token for a token
+//! scoped to the single MCP server it relays, renews it before it lapses, and
+//! keeps the agent token for nothing but asking for another. A bridge that is
+//! compromised mid-session holds an hour of one server, not the agent's grant.
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -31,6 +38,10 @@ const BLOCKED_BY_POLICY: i64 = -32001;
 
 /// How long to wait for the real server's last answers after the agent hangs up.
 const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Renew this far ahead of expiry. Wide enough that a slow round trip does not
+/// land a call on a token that expired while it was in flight.
+const RENEW_MARGIN_SECS: i64 = 120;
 
 pub struct BridgeOptions {
     pub server: String,
@@ -75,12 +86,128 @@ pub fn blocked_response(message: &Value, reason: &str) -> Option<Value> {
 struct Authorizer {
     http: reqwest::Client,
     admin_url: String,
-    token: String,
+    /// The standing credential. Once workload identity is on, this is used for
+    /// exactly one thing: asking for a token that is not standing.
+    agent_token: String,
     server: String,
+    /// The workload token in force, when the daemon asks for one. Behind a lock
+    /// because a renewal must not race itself — two renewals from the same
+    /// generation supersede each other, and the loser looks like a replay.
+    workload: Mutex<Option<Session>>,
+}
+
+struct Session {
+    token: String,
+    expires_at: i64,
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    token: String,
+    expires_in: i64,
 }
 
 impl Authorizer {
+    /// The credential for the next call, renewed first if it is close to lapsing.
+    async fn credential(&self) -> Result<String> {
+        let mut current = self.workload.lock().await;
+        let Some(session) = current.as_ref() else {
+            return Ok(self.agent_token.clone());
+        };
+        if session.expires_at - now() > RENEW_MARGIN_SECS {
+            return Ok(session.token.clone());
+        }
+
+        let renewed = match self.rotate(&session.token).await {
+            Ok(session) => session,
+            // A lineage can end underneath a long session: an operator revoked
+            // it, or the daemon restarted and took its ledger with it. Neither
+            // is fatal — the agent token is still good for asking again.
+            Err(error) => {
+                tracing::warn!(%error, "renewing the workload token failed; minting a new one");
+                self.mint().await?
+            }
+        };
+        let token = renewed.token.clone();
+        *current = Some(renewed);
+        Ok(token)
+    }
+
+    /// Exchange the agent token for one scoped to this server and nothing else.
+    async fn mint(&self) -> Result<Session> {
+        self.token_request(
+            "/token",
+            &self.agent_token,
+            json!({
+                "workload": format!("mcp-bridge/{}", self.server),
+                "scope": [{ "kind": "mcp", "target": self.server }],
+            }),
+        )
+        .await
+        .context("minting a workload token for this MCP session")
+    }
+
+    async fn rotate(&self, current: &str) -> Result<Session> {
+        self.token_request("/token/renew", current, json!({})).await
+    }
+
+    async fn token_request(&self, path: &str, credential: &str, body: Value) -> Result<Session> {
+        let response = self
+            .http
+            .post(format!("{}{path}", self.admin_url))
+            .bearer_auth(credential)
+            .json(&body)
+            .send()
+            .await
+            .context("the daemon did not answer the token request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            // The body carries the daemon's reason; it is about the request, not
+            // about any credential, so it is safe to repeat.
+            let detail = response.text().await.unwrap_or_default();
+            bail!("the daemon answered the token request with {status}: {detail}");
+        }
+
+        let issued: TokenResponse = response
+            .json()
+            .await
+            .context("the daemon's token response was not readable")?;
+        Ok(Session {
+            expires_at: now() + issued.expires_in,
+            token: issued.token,
+        })
+    }
+
+    /// Move this bridge onto workload identity for the rest of the session.
+    async fn adopt_workload_identity(&self) -> Result<()> {
+        let session = self.mint().await?;
+        *self.workload.lock().await = Some(session);
+        Ok(())
+    }
+
+    /// Give the token back at the end of the session. Best effort: it expires
+    /// on its own regardless, and a bridge that cannot reach the daemon on the
+    /// way out has nothing useful left to do about it.
+    async fn surrender(&self) {
+        let Some(session) = self.workload.lock().await.take() else {
+            return;
+        };
+        let _ = self
+            .http
+            .post(format!("{}/token/revoke", self.admin_url))
+            .bearer_auth(&session.token)
+            .json(&json!({ "lineage": true }))
+            .send()
+            .await;
+    }
+
     async fn authorize(&self, method: &str, name: &str) -> AuthorizeResult {
+        let credential = match self.credential().await {
+            Ok(credential) => credential,
+            // No usable identity, no call. Same rule as an unreachable daemon.
+            Err(error) => return deny(format!("no usable workload token: {error}")),
+        };
         let body = json!({
             "kind": "mcp",
             "target": self.server,
@@ -90,7 +217,7 @@ impl Authorizer {
         let response = self
             .http
             .post(format!("{}/authorize", self.admin_url))
-            .bearer_auth(&self.token)
+            .bearer_auth(&credential)
             .json(&body)
             .send()
             .await;
@@ -109,8 +236,10 @@ impl Authorizer {
         }
     }
 
-    /// Confirm the policy authority is reachable before accepting any message.
-    async fn probe(&self) -> Result<()> {
+    /// Confirm the policy authority is reachable before accepting any message,
+    /// and learn whether it wants workload identity. That answer rides along on
+    /// the health check the bridge already has to make.
+    async fn probe(&self) -> Result<bool> {
         let response = self
             .http
             .get(format!("{}/health", self.admin_url))
@@ -129,16 +258,24 @@ impl Authorizer {
                 response.status()
             );
         }
-        Ok(())
+
+        // An older daemon says nothing about workload identity, and the bridge
+        // carries on with the agent token exactly as it did before.
+        let health: Value = response.json().await.unwrap_or_else(|_| json!({}));
+        Ok(!matches!(
+            health.get("workload_identity").and_then(Value::as_str),
+            None | Some("off")
+        ))
     }
 
     /// Open the session: authenticates the agent token and checks its `targets`,
     /// and writes the `session_start` record. Any failure is fatal to the bridge.
     async fn start_session(&self) -> Result<()> {
+        let credential = self.credential().await?;
         let response = self
             .http
             .post(format!("{}/event", self.admin_url))
-            .bearer_auth(&self.token)
+            .bearer_auth(&credential)
             .json(&json!({
                 "kind": "mcp",
                 "event": "session_start",
@@ -165,6 +302,10 @@ impl Authorizer {
     }
 
     async fn event(&self, event: &str, error: Option<String>, detail: Option<Value>) {
+        let Ok(credential) = self.credential().await else {
+            tracing::warn!("dropping a `{event}` record: no usable workload token");
+            return;
+        };
         let body = json!({
             "kind": "mcp",
             "event": event,
@@ -175,11 +316,15 @@ impl Authorizer {
         let _ = self
             .http
             .post(format!("{}/event", self.admin_url))
-            .bearer_auth(&self.token)
+            .bearer_auth(&credential)
             .json(&body)
             .send()
             .await;
     }
+}
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 fn deny(reason: String) -> AuthorizeResult {
@@ -221,14 +366,25 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
     let authorizer = Arc::new(Authorizer {
         http: reqwest::Client::new(),
         admin_url: options.admin_url.trim_end_matches('/').to_string(),
-        token: options.agent_token,
+        agent_token: options.agent_token,
         server: options.server.clone(),
+        workload: Mutex::new(None),
     });
 
     // Prove the policy authority is up before the agent sends anything. This is
     // a health check rather than a real authorization so the probe never shows
     // up in the audit log as a call the agent did not make.
-    authorizer.probe().await?;
+    let wants_workload_identity = authorizer.probe().await?;
+
+    // Then stop being the agent. From here the bridge runs on a token scoped to
+    // this one server and expiring on its own, so the credential this process
+    // holds for the next hour is worth a great deal less than the one it had.
+    if wants_workload_identity {
+        authorizer
+            .adopt_workload_identity()
+            .await
+            .context("this daemon issues workload tokens and the bridge could not get one")?;
+    }
 
     // Then prove *this* agent may address *this* server, before a single secret
     // is resolved. The bridge used to spawn the real server — credentials and
@@ -323,6 +479,9 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
     }
 
     authorizer.event("session_end", None, None).await;
+    // Hand the token back rather than leaving it live until it expires. The
+    // session is over; there is nothing left for it to authorise.
+    authorizer.surrender().await;
     Ok(())
 }
 
