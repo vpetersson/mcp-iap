@@ -121,6 +121,13 @@ enum AuditCommand {
         path: PathBuf,
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
+        /// Only this agent. One proxy fronts many agents, so the log is
+        /// interleaved and "what has bravo been doing" is the usual question.
+        #[arg(long, value_name = "ID")]
+        agent: Option<String>,
+        /// Only this upstream or MCP server.
+        #[arg(long, value_name = "NAME")]
+        target: Option<String>,
     },
 }
 
@@ -188,7 +195,12 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Audit(AuditCommand::Verify { path }) => verify_audit(&path),
-        Command::Audit(AuditCommand::Tail { path, lines }) => tail_audit(&path, lines),
+        Command::Audit(AuditCommand::Tail {
+            path,
+            lines,
+            agent,
+            target,
+        }) => tail_audit(&path, lines, agent.as_deref(), target.as_deref()),
     }
 }
 
@@ -485,15 +497,42 @@ fn verify_audit(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn tail_audit(path: &Path, lines: usize) -> Result<()> {
+fn tail_audit(path: &Path, lines: usize, agent: Option<&str>, target: Option<&str>) -> Result<()> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading `{}`", path.display()))?;
-    let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    for line in all.iter().skip(all.len().saturating_sub(lines)) {
+
+    let filtered = agent.is_some() || target.is_some();
+    let mut rendered: Vec<String> = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
         match serde_json::from_str::<audit::AuditEvent>(line) {
-            Ok(event) => println!("{} {}", event.ts, event.oneline()),
-            Err(_) => println!("{line}"),
+            Ok(event) => {
+                if !event.matches(agent, target) {
+                    continue;
+                }
+                rendered.push(format!("{} {}", event.ts, event.oneline()));
+            }
+            // A line this build cannot parse is still evidence, so it is shown
+            // verbatim — but it cannot be matched against a filter, and passing
+            // it through a filtered view would misreport it as a hit.
+            Err(_) if !filtered => rendered.push(line.to_string()),
+            Err(_) => {}
         }
+    }
+
+    // Filter first, then take the last N: `-n 20 --agent bravo` means bravo's
+    // last twenty, not whatever bravo did inside the log's last twenty.
+    for line in rendered.iter().skip(rendered.len().saturating_sub(lines)) {
+        println!("{line}");
+    }
+
+    if rendered.is_empty() && filtered {
+        let what = match (agent, target) {
+            (Some(agent), Some(target)) => format!("agent `{agent}` and target `{target}`"),
+            (Some(agent), None) => format!("agent `{agent}`"),
+            (None, Some(target)) => format!("target `{target}`"),
+            (None, None) => unreachable!("filtered implies one of the two is set"),
+        };
+        eprintln!("no entries for {what}");
     }
     Ok(())
 }
