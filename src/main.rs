@@ -1,7 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::io::Read;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,6 +13,7 @@ use mcp_iap::list::{Inventory, ListOptions, What};
 use mcp_iap::mcp;
 use mcp_iap::profiles;
 use mcp_iap::state::AppState;
+use mcp_iap::tls::{self, ServerTls};
 
 #[derive(Parser)]
 #[command(
@@ -586,10 +586,11 @@ fn main() -> Result<()> {
             init_tracing(false, &config)?;
             let admin_url = admin_url
                 .or_else(|| {
+                    let scheme = tls::scheme(config.server.admin_tls_material().is_some());
                     config
                         .server
                         .admin_listen
-                        .map(|addr| format!("http://{addr}"))
+                        .map(|addr| format!("{scheme}://{addr}"))
                 })
                 .context(
                     "no control-plane address — pass --admin-url or set server.admin_listen",
@@ -771,44 +772,52 @@ async fn run(config: Config, tui: bool) -> Result<()> {
     let audit_to_stderr = config.audit.stderr && !tui;
 
     let state = AppState::build(config, audit_to_stderr)?;
+
+    // Before anything binds. The secrets are already warm from `AppState`; this
+    // is where a malformed certificate, or a key that belongs to a different
+    // one, stops the process instead of becoming a failed handshake later.
+    let tls = ServerTls::load(&state.config.server, &state.resolver)?;
+    let (proxy_scheme, admin_scheme) = (tls.proxy_scheme(), tls.admin_scheme());
+
     state.log_startup()?;
 
     // The console and the control API are the only things that can answer an
     // `ask`. Without either, `ask` denies rather than hanging.
     state.broker.set_has_approver(tui);
 
-    let proxy_listener = tokio::net::TcpListener::bind(listen)
-        .await
+    let proxy_listener = std::net::TcpListener::bind(listen)
         .with_context(|| format!("binding the proxy to {listen}"))?;
-    let proxy = axum::serve(
+    let proxy = tls::serve(
         proxy_listener,
-        mcp_iap::proxy::router(Arc::clone(&state))
-            .into_make_service_with_connect_info::<SocketAddr>(),
-    );
+        mcp_iap::proxy::router(Arc::clone(&state)),
+        tls.proxy,
+    )?;
 
     let admin = match admin_listen {
         Some(addr) => {
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
+            let listener = std::net::TcpListener::bind(addr)
                 .with_context(|| format!("binding the control plane to {addr}"))?;
             let token_path = write_admin_token(&audit_path, &state.admin_token)?;
             if !tui {
                 eprintln!(
-                    "control plane on http://{addr} (token in {})",
+                    "control plane on {}://{addr} (token in {})",
+                    admin_scheme,
                     token_path.display()
                 );
             }
-            Some(axum::serve(
+            Some(tls::serve(
                 listener,
                 mcp_iap::admin::router(Arc::clone(&state)),
-            ))
+                tls.admin,
+            )?)
         }
         None => None,
     };
 
     if !tui {
         eprintln!(
-            "mcp-iap listening on http://{listen} — {} agents, {} rules, default {}",
+            "mcp-iap listening on {}://{listen} — {} agents, {} rules, default {}",
+            proxy_scheme,
             state.agents.len(),
             state.acl.rule_count(),
             state.acl.default_action()
@@ -900,13 +909,20 @@ fn list_config(path: &Path, options: &ListOptions, output: OutputArg) -> Result<
 fn check(path: &Path) -> Result<()> {
     let config = Config::load(path)?;
     println!("config      {}", path.display());
-    println!("proxy       {}", config.server.listen);
+    println!(
+        "proxy       {}://{}",
+        tls::scheme(config.server.tls.is_some()),
+        config.server.listen
+    );
     println!(
         "control     {}",
         config
             .server
             .admin_listen
-            .map(|a| a.to_string())
+            .map(|a| format!(
+                "{}://{a}",
+                tls::scheme(config.server.admin_tls_material().is_some())
+            ))
             .unwrap_or_else(|| "disabled".into())
     );
     println!("audit log   {}", config.audit.path.display());
@@ -979,6 +995,15 @@ fn check(path: &Path) -> Result<()> {
             references.len()
         );
     }
+
+    // Resolving the certificate is not the same as it being usable: `check`
+    // runs the same load the listener will, so a mismatched pair is found here
+    // rather than by the first agent to connect.
+    if config.server.tls.is_some() || config.server.admin_tls.is_some() {
+        ServerTls::load(&config.server, &resolver)?;
+        println!("tls         ok      certificate and key parse and match");
+    }
+
     println!("\nconfig is valid.");
     Ok(())
 }

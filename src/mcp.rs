@@ -218,8 +218,14 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
         .cloned()
         .with_context(|| format!("`{}` is not a configured MCP server", options.server))?;
 
+    let resolver = Arc::new(SecretResolver::new(config.server.op_binary.clone()));
+
+    // The control plane may be on TLS with a certificate no public root signs,
+    // which is the normal case for a loopback listener. The bridge reads the
+    // same policy file, so it trusts exactly that certificate and nothing else
+    // new — rather than the alternative, which is turning verification off.
     let authorizer = Arc::new(Authorizer {
-        http: reqwest::Client::new(),
+        http: crate::tls::control_plane_client(config.server.admin_tls_material(), &resolver)?,
         admin_url: options.admin_url.trim_end_matches('/').to_string(),
         token: options.agent_token,
         server: options.server.clone(),
@@ -239,7 +245,6 @@ pub async fn run(config: Config, options: BridgeOptions) -> Result<()> {
         .await
         .context("the daemon refused this agent's MCP session")?;
 
-    let resolver = Arc::new(SecretResolver::new(config.server.op_binary.clone()));
     // No audit log here: the bridge's records go to the daemon, which owns the log.
     let injector = CredentialInjector::new(Arc::clone(&resolver), reqwest::Client::new(), None);
 

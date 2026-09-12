@@ -64,6 +64,27 @@ pub struct ServerConfig {
     /// Binary used to resolve `op://` references.
     #[serde(default = "default_op_bin")]
     pub op_binary: String,
+    /// TLS for the agent-facing listener. Absent means plain HTTP, so an
+    /// existing deployment keeps the behaviour it has.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    /// TLS for the control plane, when it needs a certificate of its own.
+    /// Absent, the control plane uses `[server.tls]` — it carries the admin
+    /// token and does not stay in cleartext merely because nobody named it
+    /// twice.
+    #[serde(default)]
+    pub admin_tls: Option<TlsConfig>,
+}
+
+/// A certificate and its private key, both as *references* — a key is a
+/// credential, and credentials are never literals in this file.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM certificate chain: the leaf first, then any intermediates.
+    pub cert: String,
+    /// PEM private key — PKCS#8, PKCS#1 or SEC1.
+    pub key: String,
 }
 
 impl Default for ServerConfig {
@@ -77,6 +98,8 @@ impl Default for ServerConfig {
             upstream_connect_timeout_secs: default_connect_timeout(),
             max_body_bytes: default_max_body(),
             op_binary: default_op_bin(),
+            tls: None,
+            admin_tls: None,
         }
     }
 }
@@ -113,6 +136,13 @@ impl ServerConfig {
         });
         self.admin_listen = Some(parse_bind(spec, base)?);
         Ok(())
+    }
+
+    /// The certificate the control plane serves, which is `[server.tls]`'s
+    /// unless it was given one of its own. One place decides this, so the
+    /// listener, `check` and the MCP bridge cannot disagree about it.
+    pub fn admin_tls_material(&self) -> Option<&TlsConfig> {
+        self.admin_tls.as_ref().or(self.tls.as_ref())
     }
 }
 
@@ -552,6 +582,15 @@ impl Config {
             );
         }
 
+        for (label, tls) in [
+            ("server.tls", &self.server.tls),
+            ("server.admin_tls", &self.server.admin_tls),
+        ] {
+            let Some(tls) = tls else { continue };
+            SecretRef::parse(&tls.cert).with_context(|| format!("{label}.cert"))?;
+            SecretRef::parse(&tls.key).with_context(|| format!("{label}.key"))?;
+        }
+
         let mut seen = std::collections::HashSet::new();
         for agent in &self.agents {
             if !seen.insert(&agent.id) {
@@ -655,6 +694,13 @@ impl Config {
         let mut refs = Vec::new();
         if let Some(reference) = &self.server.admin_token {
             refs.push(reference.clone());
+        }
+        for tls in [&self.server.tls, &self.server.admin_tls]
+            .into_iter()
+            .flatten()
+        {
+            refs.push(tls.cert.clone());
+            refs.push(tls.key.clone());
         }
         for agent in &self.agents {
             if let Some(reference) = &agent.token_ref {
@@ -898,6 +944,99 @@ action = "allow"
         config.server.override_listen("127.0.0.1:0").unwrap();
         config.server.override_admin_listen("127.0.0.1:0").unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn tls_is_absent_by_default_so_nothing_existing_changes() {
+        let config: Config = toml::from_str(MINIMAL).unwrap();
+        assert!(config.server.tls.is_none());
+        assert!(config.server.admin_tls_material().is_none());
+    }
+
+    #[test]
+    fn the_certificate_and_the_key_are_references_and_are_preloaded_like_any_other_secret() {
+        let config: Config = toml::from_str(&format!(
+            r#"{MINIMAL}
+[server.tls]
+cert = "file:/etc/mcp-iap/fullchain.pem"
+key = "op://Infra/mcp-iap tls/private key"
+"#
+        ))
+        .unwrap();
+        config.validate().unwrap();
+
+        // Startup resolves these alongside everything else, so a locked vault
+        // fails the process instead of the first handshake.
+        let refs = config.secret_refs();
+        assert!(refs.contains(&"file:/etc/mcp-iap/fullchain.pem".to_string()));
+        assert!(refs.contains(&"op://Infra/mcp-iap tls/private key".to_string()));
+    }
+
+    #[test]
+    fn a_key_pasted_in_place_of_a_reference_is_rejected_without_being_echoed() {
+        let config: Config = toml::from_str(&format!(
+            r#"{MINIMAL}
+[server.tls]
+cert = "file:/etc/mcp-iap/fullchain.pem"
+key = "-----BEGIN PRIVATE KEY-----"
+"#
+        ))
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("server.tls.key"), "{error}");
+        assert!(!error.contains("BEGIN PRIVATE KEY"), "{error}");
+    }
+
+    #[test]
+    fn the_control_plane_inherits_the_proxys_certificate_unless_given_its_own() {
+        let inherited: Config = toml::from_str(&format!(
+            r#"{MINIMAL}
+[server.tls]
+cert = "file:/c.pem"
+key = "file:/k.pem"
+"#
+        ))
+        .unwrap();
+        assert_eq!(
+            inherited.server.admin_tls_material(),
+            inherited.server.tls.as_ref()
+        );
+
+        let separate: Config = toml::from_str(&format!(
+            r#"{MINIMAL}
+[server.tls]
+cert = "file:/c.pem"
+key = "file:/k.pem"
+
+[server.admin_tls]
+cert = "file:/admin.pem"
+key = "file:/admin-key.pem"
+"#
+        ))
+        .unwrap();
+        separate.validate().unwrap();
+        assert_eq!(
+            separate
+                .server
+                .admin_tls_material()
+                .map(|t| t.cert.as_str()),
+            Some("file:/admin.pem")
+        );
+    }
+
+    #[test]
+    fn a_typo_in_the_tls_table_is_a_hard_error_rather_than_a_silent_downgrade() {
+        let error = toml::from_str::<Config>(&format!(
+            r#"{MINIMAL}
+[server.tls]
+cert = "file:/c.pem"
+key = "file:/k.pem"
+min_version = "1.0"
+"#
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("min_version"), "{error}");
     }
 
     #[test]
