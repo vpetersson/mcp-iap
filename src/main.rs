@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::io::Read;
 use std::net::SocketAddr;
@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use mcp_iap::audit;
 use mcp_iap::config::Config;
+use mcp_iap::enroll;
 use mcp_iap::identity;
 use mcp_iap::init::{self, InitOptions, Template};
 use mcp_iap::list::{Inventory, ListOptions, What};
@@ -39,7 +40,7 @@ struct ConfigArg {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Write a policy file, agent token and all, ready to run.
+    /// Write a policy file the proxy will start with.
     Init {
         #[command(flatten)]
         config: ConfigArg,
@@ -50,9 +51,10 @@ enum Command {
         /// `file:/path` or `op://vault/item/field`. Starter template only.
         #[arg(long, value_name = "REF")]
         secret: Option<String>,
-        /// `starter` is one agent and one upstream; `full` is the annotated
-        /// example, with GitHub, MCP and a service account worked out.
-        #[arg(long, value_enum, default_value_t = TemplateArg::Starter)]
+        /// `minimal` is the proxy and nothing else; `starter` adds one agent
+        /// and one Anthropic upstream; `full` is the annotated example, with
+        /// GitHub, MCP and a service account worked out.
+        #[arg(long, value_enum, default_value_t = TemplateArg::Minimal)]
         template: TemplateArg,
         /// Replace an existing file. Mints a new token, retiring the old one.
         #[arg(short, long)]
@@ -108,6 +110,15 @@ enum Command {
         #[command(flatten)]
         config: ConfigArg,
     },
+    /// Enrol an agent, an upstream or a rule into the policy file.
+    #[command(subcommand)]
+    Agent(AgentCommand),
+    /// Add or inspect the services the proxy fronts.
+    #[command(subcommand)]
+    Upstream(UpstreamCommand),
+    /// Add a rule to the ACL.
+    #[command(subcommand)]
+    Acl(AclCommand),
     /// Mint an agent token and print the config block to paste.
     GenToken {
         /// Agent id to use in the printed block.
@@ -148,6 +159,7 @@ enum OutputArg {
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
 enum TemplateArg {
+    Minimal,
     Starter,
     Full,
 }
@@ -155,8 +167,120 @@ enum TemplateArg {
 impl From<TemplateArg> for Template {
     fn from(arg: TemplateArg) -> Self {
         match arg {
+            TemplateArg::Minimal => Template::Minimal,
             TemplateArg::Starter => Template::Starter,
             TemplateArg::Full => Template::Full,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// Mint a token, enrol the agent, and write only the hash to the file.
+    Add {
+        /// Id the agent authenticates as, and the name every audit record uses.
+        id: String,
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Display name for the console, when the id is not what a human calls it.
+        #[arg(long)]
+        name: Option<String>,
+        /// Upstream or MCP server this agent may address at all. Repeatable.
+        /// Omit for "any", which still leaves the ACL in charge.
+        #[arg(long = "target", value_name = "NAME")]
+        targets: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum UpstreamCommand {
+    /// Add a service the proxy fronts, and the credential it attaches.
+    Add {
+        /// Routing prefix and policy name: agents call `/<name>/<path>`.
+        name: String,
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Where the proxy forwards to, e.g. `https://api.anthropic.com`.
+        #[arg(long, value_name = "URL")]
+        base_url: String,
+        /// Credential scheme to inject on the way out.
+        #[arg(long, value_enum, default_value_t = AuthArg::None)]
+        auth: AuthArg,
+        /// Credential *reference*: `env:NAME`, `file:/path`, `op://vault/item/field`.
+        #[arg(long, value_name = "REF")]
+        secret: Option<String>,
+        /// Header name for `--auth header`, e.g. `x-api-key`.
+        #[arg(long, value_name = "NAME")]
+        header: Option<String>,
+        /// Value prefix for `--auth header`, when the API wants one.
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+        /// Username for `--auth basic`.
+        #[arg(long)]
+        username: Option<String>,
+        /// Query parameter for `--auth query`, e.g. `key`.
+        #[arg(long, value_name = "NAME")]
+        param: Option<String>,
+        /// Static header to send upstream, `Name=Value`. Repeatable. Never a
+        /// credential — that is what `--secret` is for.
+        #[arg(long = "set-header", value_name = "NAME=VALUE")]
+        set_headers: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AclCommand {
+    /// Append a rule. Appended, not inserted: first match wins, so a new rule
+    /// cannot silently shadow one already in the file.
+    Add {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Shown in the audit log and the TUI, so a decision traces to a rule.
+        #[arg(long)]
+        name: Option<String>,
+        /// Agent id or glob. Defaults to every agent.
+        #[arg(long, default_value = "*")]
+        agent: String,
+        /// `http`, `mcp`, or `*`.
+        #[arg(long, default_value = "*")]
+        kind: String,
+        /// Upstream or MCP server name, or `*`.
+        #[arg(long, default_value = "*")]
+        target: String,
+        /// HTTP verbs, or JSON-RPC methods such as `tools/call`. Repeatable.
+        #[arg(long = "methods", value_name = "METHOD", default_values_t = [String::from("*")])]
+        methods: Vec<String>,
+        /// URL paths, or for MCP the tool name. Repeatable.
+        #[arg(long = "paths", value_name = "PATH", default_values_t = [String::from("**")])]
+        paths: Vec<String>,
+        /// `allow`, `deny`, or `ask` to prompt a human in `run --tui`.
+        #[arg(long, value_enum, default_value_t = ActionArg::Allow)]
+        action: ActionArg,
+    },
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum AuthArg {
+    None,
+    Bearer,
+    Header,
+    Basic,
+    Query,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum ActionArg {
+    Allow,
+    Deny,
+    Ask,
+}
+
+impl ActionArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            ActionArg::Allow => "allow",
+            ActionArg::Deny => "deny",
+            ActionArg::Ask => "ask",
         }
     }
 }
@@ -275,6 +399,54 @@ fn main() -> Result<()> {
             output,
         ),
         Command::Check { config } => check(&config.config),
+        Command::Agent(AgentCommand::Add {
+            id,
+            config,
+            name,
+            targets,
+        }) => add_agent(&config.config, &id, name.as_deref(), &targets),
+        Command::Upstream(UpstreamCommand::Add {
+            name,
+            config,
+            base_url,
+            auth,
+            secret,
+            header,
+            prefix,
+            username,
+            param,
+            set_headers,
+        }) => add_upstream(AddUpstream {
+            path: config.config,
+            name,
+            base_url,
+            auth,
+            secret,
+            header,
+            prefix,
+            username,
+            param,
+            set_headers,
+        }),
+        Command::Acl(AclCommand::Add {
+            config,
+            name,
+            agent,
+            kind,
+            target,
+            methods,
+            paths,
+            action,
+        }) => add_rule(
+            &config.config,
+            name.as_deref(),
+            &agent,
+            &kind,
+            &target,
+            &methods,
+            &paths,
+            action,
+        ),
         Command::GenToken { id } => gen_token(&id),
         Command::HashToken { token } => {
             let token = match token {
@@ -552,9 +724,27 @@ fn init_config(options: &InitOptions) -> Result<()> {
     let written = init::init(options)?;
     let path = written.path.display();
 
-    println!("Wrote {path} for agent `{}`.\n", written.agent);
+    let (Some(agent), Some(token)) = (written.agent.as_deref(), written.token.as_deref()) else {
+        // The minimal template. Nothing was granted, so the useful thing to
+        // print is the shortest path to a proxy that does something.
+        println!(
+            "Wrote {path}. No agents, no upstreams — the proxy starts and denies everything.\n"
+        );
+        println!("Add what it should front:");
+        println!(
+            "  mcp-iap upstream add anthropic --base-url https://api.anthropic.com \\\n             \x20     --auth header --header x-api-key --secret env:ANTHROPIC_API_KEY"
+        );
+        println!("  mcp-iap acl add --target anthropic --methods POST --paths /v1/messages");
+        println!("  mcp-iap agent add claude-code --target anthropic\n");
+        println!("Then:");
+        println!("  mcp-iap check --config {path}   # resolves every credential reference");
+        println!("  mcp-iap run --config {path} --tui");
+        return Ok(());
+    };
+
+    println!("Wrote {path} for agent `{agent}`.\n");
     println!("The agent's token — shown once, and not any upstream's credential:\n");
-    println!("  {}\n", written.token);
+    println!("  {token}\n");
 
     println!("Next:");
     // Only `env:` has a step the operator can act on from here; anything else
@@ -574,8 +764,149 @@ fn init_config(options: &InitOptions) -> Result<()> {
         "  export ANTHROPIC_BASE_URL=http://{}/anthropic",
         written.listen
     );
-    println!("  export ANTHROPIC_AUTH_TOKEN={}", written.token);
-    println!("\nAdd another agent with `mcp-iap gen-token <id>`.");
+    println!("  export ANTHROPIC_AUTH_TOKEN={token}");
+    println!("\nAdd another agent with `mcp-iap agent add <id>`.");
+    Ok(())
+}
+
+fn add_agent(path: &Path, id: &str, name: Option<&str>, targets: &[String]) -> Result<()> {
+    let enrolled = enroll::add_agent(path, id, name, targets)?;
+    println!("Added agent `{}` to {}.\n", enrolled.id, path.display());
+    println!("Its token — shown once, and not any upstream's credential:\n");
+    println!("  {}\n", enrolled.token);
+    if targets.is_empty() {
+        println!("It may address any target, subject to the ACL.");
+    } else {
+        println!("It may address: {}.", targets.join(", "));
+    }
+    // An agent with no rule matching it is the quiet failure: the file is
+    // valid, the token works, and every call it makes is denied.
+    if enroll::rule_count(path)? == 0 {
+        println!(
+            "\nThere are no `[[acl]]` rules yet, so every request still falls through to \
+             `acl_default` and is denied. Add one with `mcp-iap acl add`."
+        );
+    }
+    Ok(())
+}
+
+/// Grouped because clap hands back ten flags and `too_many_arguments` is right.
+struct AddUpstream {
+    path: PathBuf,
+    name: String,
+    base_url: String,
+    auth: AuthArg,
+    secret: Option<String>,
+    header: Option<String>,
+    prefix: Option<String>,
+    username: Option<String>,
+    param: Option<String>,
+    set_headers: Vec<String>,
+}
+
+fn add_upstream(options: AddUpstream) -> Result<()> {
+    let AddUpstream {
+        path,
+        name,
+        base_url,
+        auth,
+        secret,
+        header,
+        prefix,
+        username,
+        param,
+        set_headers,
+    } = options;
+
+    // Each scheme needs a different subset of the flags, and silently ignoring
+    // one the operator did pass is how a credential ends up not being sent.
+    let need_secret = || -> Result<String> {
+        secret.clone().context(
+            "this `--auth` scheme needs `--secret <REF>` — the credential reference to inject",
+        )
+    };
+    let auth = match auth {
+        AuthArg::None => enroll::AuthSpec::None,
+        AuthArg::Bearer => enroll::AuthSpec::Bearer {
+            secret: need_secret()?,
+        },
+        AuthArg::Header => enroll::AuthSpec::Header {
+            header: header
+                .clone()
+                .context("`--auth header` needs `--header <NAME>`, e.g. `--header x-api-key`")?,
+            secret: need_secret()?,
+            prefix: prefix.clone(),
+        },
+        AuthArg::Basic => enroll::AuthSpec::Basic {
+            username: username
+                .clone()
+                .context("`--auth basic` needs `--username <NAME>`")?,
+            secret: need_secret()?,
+        },
+        AuthArg::Query => enroll::AuthSpec::Query {
+            param: param
+                .clone()
+                .context("`--auth query` needs `--param <NAME>`, e.g. `--param key`")?,
+            secret: need_secret()?,
+        },
+    };
+    if matches!(auth, enroll::AuthSpec::None) && secret.is_some() {
+        bail!("`--secret` was given but `--auth` is `none`, so nothing would be injected");
+    }
+
+    let headers = set_headers
+        .iter()
+        .map(|raw| {
+            raw.split_once('=')
+                .map(|(key, value)| (key.trim().to_string(), value.to_string()))
+                .with_context(|| format!("`--set-header {raw}` should be `Name=Value`"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    enroll::add_upstream(&path, &name, &base_url, &auth, &headers)?;
+    println!("Added upstream `{name}` to {}.", path.display());
+    println!("Agents reach it at `/{name}/<path>`.");
+    if enroll::rule_count(&path)? == 0 {
+        println!(
+            "\nNo `[[acl]]` rules yet, so it is not reachable. Allow something with:\n  \
+             mcp-iap acl add --target {name} --methods GET --paths '/**'"
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_rule(
+    path: &Path,
+    name: Option<&str>,
+    agent: &str,
+    kind: &str,
+    target: &str,
+    methods: &[String],
+    paths: &[String],
+    action: ActionArg,
+) -> Result<()> {
+    enroll::add_rule(
+        path,
+        name,
+        agent,
+        kind,
+        target,
+        methods,
+        paths,
+        action.as_str(),
+    )?;
+    let count = enroll::rule_count(path)?;
+    println!(
+        "Added rule {count} of {count} to {}: {} {} {} on `{target}` for `{agent}`.",
+        path.display(),
+        action.as_str(),
+        methods.join(","),
+        paths.join(","),
+    );
+    // Position is the whole semantics of an ACL, so say it rather than making
+    // the operator infer it from the file.
+    println!("Rules match in file order and the first match wins, so this one is checked last.");
     Ok(())
 }
 

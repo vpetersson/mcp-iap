@@ -34,8 +34,12 @@ pub const DEFAULT_SECRET_REF: &str = "env:ANTHROPIC_API_KEY";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Template {
-    /// One agent, one upstream, one rule, default deny.
+    /// Server, audit and `deny` — nothing to reach and nobody to reach it.
+    /// The default, because the alternatives both guess: one guesses that you
+    /// want Anthropic, and both mint a token you did not ask for.
     #[default]
+    Minimal,
+    /// One agent, one upstream, one rule, default deny.
     Starter,
     /// The shipped example: GitHub, an MCP server and a service account too.
     Full,
@@ -59,7 +63,7 @@ impl Default for InitOptions {
             path: PathBuf::from("iap.toml"),
             agent: DEFAULT_AGENT_ID.to_string(),
             secret: None,
-            template: Template::Starter,
+            template: Template::Minimal,
             force: false,
         }
     }
@@ -68,10 +72,11 @@ impl Default for InitOptions {
 /// What `init` wrote, so the caller can tell the operator what to do next.
 pub struct Initialized {
     pub path: PathBuf,
-    /// The agent's token in plaintext. This is the only time it exists — only
-    /// its hash was written to the file.
-    pub token: String,
-    pub agent: String,
+    /// The agent's token in plaintext, when the template enrolled one. This is
+    /// the only time it exists — only its hash was written to the file.
+    pub token: Option<String>,
+    /// The agent the template enrolled, if any. `Minimal` enrolls none.
+    pub agent: Option<String>,
     /// Credential reference in the written file, when the template has exactly
     /// one to point at.
     pub secret: Option<String>,
@@ -101,7 +106,11 @@ pub fn init(options: &InitOptions) -> Result<Initialized> {
             "`--secret` applies to the starter template; the full template ships its own \
              credential references for several upstreams"
         ),
-        (Template::Full, None) => None,
+        (Template::Minimal, Some(_)) => bail!(
+            "`--secret` applies to the starter template; the minimal template writes no \
+             upstream to attach a credential to — add one with `mcp-iap upstream add`"
+        ),
+        (Template::Full | Template::Minimal, None) => None,
         (Template::Starter, reference) => {
             let reference = reference.unwrap_or(DEFAULT_SECRET_REF);
             check_secret_ref(reference)?;
@@ -109,11 +118,17 @@ pub fn init(options: &InitOptions) -> Result<Initialized> {
         }
     };
 
-    let token = identity::generate_token()?;
+    // Minting is what makes a token exist at all, so the minimal template must
+    // not do it: an operator who never asked for an agent should not have to
+    // wonder whether the credential in their scrollback is now live.
+    let token = match options.template {
+        Template::Minimal => None,
+        Template::Starter | Template::Full => Some(identity::generate_token()?),
+    };
     let text = render(
         options.template,
         &options.agent,
-        &identity::token_hash(&token),
+        token.as_deref().map(identity::token_hash).as_deref(),
         secret.as_deref(),
     );
 
@@ -131,7 +146,10 @@ pub fn init(options: &InitOptions) -> Result<Initialized> {
     Ok(Initialized {
         path: options.path.clone(),
         token,
-        agent: options.agent.clone(),
+        agent: match options.template {
+            Template::Minimal => None,
+            Template::Starter | Template::Full => Some(options.agent.clone()),
+        },
         secret,
         listen: config.server.listen,
     })
@@ -174,14 +192,67 @@ fn write_new(path: &Path, text: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn render(template: Template, agent: &str, token_hash: &str, secret: Option<&str>) -> String {
+fn render(
+    template: Template,
+    agent: &str,
+    token_hash: Option<&str>,
+    secret: Option<&str>,
+) -> String {
+    // `Minimal` is the only template that enrols nobody; the other two are
+    // unreachable without the hash, and `init` always mints one for them.
+    let token_hash = token_hash.unwrap_or_default();
     match template {
+        Template::Minimal => minimal(),
         Template::Starter => starter(agent, token_hash, secret.unwrap_or(DEFAULT_SECRET_REF)),
         Template::Full => EXAMPLE
             .replace(EXAMPLE_TOKEN_PLACEHOLDER, token_hash)
             .replace(EXAMPLE_AGENT_ID, agent)
             .replace(EXAMPLE_AGENT_NAME, agent),
     }
+}
+
+/// The default: a file that starts a proxy and grants nothing.
+///
+/// Every line here is about the proxy itself — where it listens, where it
+/// writes its audit log, what it does with a request no rule matched. There is
+/// no agent and no upstream, so there is nothing to guess wrong and no token
+/// minted for an agent that may never exist. `upstream add` and `agent add`
+/// fill it in.
+fn minimal() -> String {
+    r##"# mcp-iap policy file, written by `mcp-iap init`.
+#
+# Nothing here is a credential — only *references* to them, resolved inside the
+# proxy at startup. This file is safe to commit.
+#
+# It has no agents and no upstreams yet: the proxy starts, listens, and denies
+# everything, because `acl_default` is deny and there is nothing to reach.
+# Fill it in without editing TOML by hand:
+#
+#   mcp-iap upstream add anthropic --base-url https://api.anthropic.com \
+#       --auth header --header x-api-key --secret env:ANTHROPIC_API_KEY
+#   mcp-iap acl add --target anthropic --methods POST --paths /v1/messages
+#   mcp-iap agent add claude-code --target anthropic
+#
+# `mcp-iap init --template starter` writes that Anthropic setup for you;
+# `--template full` writes the annotated example, GitHub and MCP and all.
+
+[server]
+listen = "127.0.0.1:8080"        # where agents connect
+admin_listen = "127.0.0.1:8081"  # control plane: the TUI and the MCP bridge
+approval_timeout_secs = 120      # an unanswered `ask` denies after this
+
+[audit]
+path = "audit/iap-audit.jsonl"
+stderr = true
+log_bodies = false               # bodies carry prompts and customer data
+
+# First matching rule wins, and with no `[[acl]]` rules every request falls
+# through to here. `action` is "allow", "deny" or "ask".
+
+[acl_default]
+action = "deny"
+"##
+    .to_string()
 }
 
 fn starter(agent: &str, token_hash: &str, secret: &str) -> String {
@@ -303,6 +374,61 @@ mod tests {
         config
     }
 
+    /// What the default now writes: a proxy, and no decisions made for you.
+    #[test]
+    fn the_minimal_template_enrols_nobody_and_mints_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iap.toml");
+        let written = init(&InitOptions {
+            path: path.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(
+            written.token.is_none(),
+            "a token nobody asked for is a credential nobody knows to revoke"
+        );
+        assert!(written.agent.is_none());
+
+        let config = load(&std::fs::read_to_string(&path).unwrap());
+        assert!(config.agents.is_empty());
+        assert!(config.upstreams.is_empty());
+        assert!(config.acl.is_empty());
+        assert_eq!(config.acl_default.action, crate::config::Action::Deny);
+    }
+
+    /// An empty policy file still has to start a proxy — that is the half of
+    /// the request that `init` alone cannot prove.
+    #[test]
+    fn the_minimal_template_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iap.toml");
+        init(&InitOptions {
+            path: path.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        load(&std::fs::read_to_string(&path).unwrap())
+            .validate()
+            .expect("the default file must start a proxy");
+    }
+
+    /// `--secret` has nothing to attach to here, and quietly ignoring it would
+    /// leave the operator believing a credential was wired up.
+    #[test]
+    fn the_minimal_template_refuses_a_secret_it_would_ignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = init(&InitOptions {
+            path: dir.path().join("iap.toml"),
+            secret: Some("env:ANTHROPIC_API_KEY".into()),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("upstream add"), "{error}");
+    }
+
     /// The point of `init`: what it writes starts a proxy, with no editing.
     #[test]
     fn the_starter_is_usable_exactly_as_written() {
@@ -310,6 +436,7 @@ mod tests {
         let path = dir.path().join("iap.toml");
         let written = init(&InitOptions {
             path: path.clone(),
+            template: Template::Starter,
             ..Default::default()
         })
         .unwrap();
@@ -321,13 +448,13 @@ mod tests {
         // agent can authenticate with it and nothing else can.
         assert_eq!(
             agent.token_sha256.as_deref(),
-            Some(identity::token_hash(&written.token).as_str())
+            Some(identity::token_hash(minted(&written)).as_str())
         );
-        assert!(written.token.starts_with("iap_"));
+        assert!(minted(&written).starts_with("iap_"));
         assert!(
             !std::fs::read_to_string(&path)
                 .unwrap()
-                .contains(&written.token),
+                .contains(minted(&written)),
             "the plaintext token must never reach the file"
         );
 
@@ -345,6 +472,15 @@ mod tests {
                 "`{target}` is granted but no rule mentions it"
             );
         }
+    }
+
+    /// Starter and Full both enrol an agent, so their token is always present;
+    /// only Minimal leaves it `None`.
+    fn minted(written: &Initialized) -> &str {
+        written
+            .token
+            .as_deref()
+            .expect("this template enrols an agent, so it mints a token")
     }
 
     #[test]
@@ -368,7 +504,7 @@ mod tests {
             config
                 .agent(DEFAULT_AGENT_ID)
                 .and_then(|a| a.token_sha256.as_deref()),
-            Some(identity::token_hash(&written.token).as_str())
+            Some(identity::token_hash(minted(&written)).as_str())
         );
         assert!(
             config.mcp_servers.iter().any(|s| s.name == "github-mcp"),
@@ -412,6 +548,7 @@ mod tests {
         let path = dir.path().join("iap.toml");
         let options = InitOptions {
             path: path.clone(),
+            template: Template::Starter,
             ..Default::default()
         };
         let first = init(&options).unwrap();
@@ -421,7 +558,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(&path)
                 .unwrap()
-                .contains(&identity::token_hash(&first.token)),
+                .contains(&identity::token_hash(minted(&first))),
             "the refused run must leave the original token in place"
         );
 
@@ -435,9 +572,9 @@ mod tests {
             "replacing the file must mint a new token"
         );
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains(&identity::token_hash(&second.token)));
+        assert!(text.contains(&identity::token_hash(minted(&second))));
         assert!(
-            !text.contains(&identity::token_hash(&first.token)),
+            !text.contains(&identity::token_hash(minted(&first))),
             "the replaced token must not still authenticate"
         );
     }
@@ -449,6 +586,7 @@ mod tests {
         init(&InitOptions {
             path: path.clone(),
             secret: Some("op://Private/Anthropic API/credential".into()),
+            template: Template::Starter,
             ..Default::default()
         })
         .unwrap();
@@ -493,6 +631,7 @@ mod tests {
         let error = init(&InitOptions {
             path: dir.path().join("iap.toml"),
             secret: Some("literal:sk-real-key".into()),
+            template: Template::Starter,
             ..Default::default()
         })
         .unwrap_err()

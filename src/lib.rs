@@ -11,6 +11,7 @@ pub mod approval;
 pub mod audit;
 pub mod config;
 pub mod credentials;
+pub mod enroll;
 pub mod identity;
 pub mod init;
 pub mod list;
