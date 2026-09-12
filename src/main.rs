@@ -690,6 +690,23 @@ fn check(path: &Path) -> Result<()> {
         config.acl.len(),
         config.acl_default.action
     );
+    // Worth a line of its own: whether the data plane takes a standing grant or
+    // an hour of one is the single biggest thing this file decides.
+    let workload = &config.server.workload_identity;
+    println!(
+        "identity    agent tokens{}",
+        match workload.mode {
+            mcp_iap::config::WorkloadMode::Off => String::new(),
+            mcp_iap::config::WorkloadMode::Optional => format!(
+                ", workload tokens accepted ({}s) — set mode = \"required\" to insist",
+                workload.lifetime_secs
+            ),
+            mcp_iap::config::WorkloadMode::Required => format!(
+                " to mint only, workload tokens required ({}s)",
+                workload.lifetime_secs
+            ),
+        }
+    );
 
     let resolver = mcp_iap::secrets::SecretResolver::new(config.server.op_binary.clone());
     let references = config.secret_refs();

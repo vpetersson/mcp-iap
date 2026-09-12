@@ -28,6 +28,11 @@ pub struct AuditRecord {
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
+    /// Which of the agent's workload tokens made the call: `lineage/generation`.
+    /// Absent for a bare agent token, which is how a log shows at a glance how
+    /// much of its traffic still runs on a standing grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<String>,
     pub target: String,
     pub method: String,
     pub path: String,

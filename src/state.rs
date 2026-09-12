@@ -8,9 +8,11 @@ use crate::acl::Acl;
 use crate::approval::ApprovalBroker;
 use crate::audit::{AuditLog, AuditRecord};
 use crate::config::Config;
+use crate::config::WorkloadMode;
 use crate::credentials::CredentialInjector;
-use crate::identity::AgentRegistry;
+use crate::identity::{AgentRegistry, AuthFailure, Caller};
 use crate::secrets::SecretResolver;
+use crate::workload::{WorkloadError, WorkloadIssuer};
 
 pub struct AppState {
     pub config: Config,
@@ -22,6 +24,7 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub resolver: Arc<SecretResolver>,
     pub admin_token: String,
+    pub workload: WorkloadIssuer,
 }
 
 /// Resolve every reference the policy file names, before anything binds a port.
@@ -118,6 +121,8 @@ impl AppState {
             None => crate::identity::generate_token()?,
         };
 
+        let workload = WorkloadIssuer::new(&config.server.workload_identity)?;
+
         Ok(Arc::new(AppState {
             config,
             agents,
@@ -128,7 +133,42 @@ impl AppState {
             http,
             resolver,
             admin_token,
+            workload,
         }))
+    }
+
+    /// Resolve whatever credential a caller presented on the data plane.
+    ///
+    /// A workload token is tried first and only when it *is* one: `NotAToken`
+    /// falls through to the agent registry, so an agent token is never reported
+    /// as a malformed JWT and a malformed JWT is never reported as an unknown
+    /// agent. In `required` mode a perfectly good agent token stops here — it
+    /// mints, and that is all it does.
+    pub fn authenticate(&self, presented: &str) -> Result<Caller, AuthFailure> {
+        if self.workload.mode().enabled() {
+            match self.workload.verify(presented) {
+                Ok(token) => {
+                    let Some(agent) = self.agents.by_id(&token.agent) else {
+                        // The token is ours and still valid, but the agent it
+                        // names has been removed from the policy file since.
+                        return Err(AuthFailure::Workload(WorkloadError::UnknownAgent(
+                            token.agent.clone(),
+                        )));
+                    };
+                    return Ok(Caller::Workload { agent, token });
+                }
+                Err(WorkloadError::NotAToken) => {}
+                Err(error) => return Err(AuthFailure::Workload(error)),
+            }
+        }
+
+        match self.agents.authenticate(presented) {
+            Some(_) if self.workload.mode() == WorkloadMode::Required => {
+                Err(AuthFailure::WorkloadRequired)
+            }
+            Some(agent) => Ok(Caller::Agent(agent)),
+            None => Err(AuthFailure::UnknownAgent),
+        }
     }
 
     /// Record that the proxy came up, so every log begins with its own provenance.
@@ -145,6 +185,10 @@ impl AppState {
             "mcp_servers": self.config.mcp_servers.len(),
             "acl_rules": self.acl.rule_count(),
             "acl_default": self.acl.default_action().to_string(),
+            // Whether this process came up handing out standing grants or
+            // short-lived ones is evidence, and the log is where evidence goes.
+            "workload_identity": self.workload.mode().to_string(),
+            "workload_lifetime_secs": self.workload.lifetime_secs(),
         }));
         self.audit
             .write(record)

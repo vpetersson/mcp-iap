@@ -1,8 +1,10 @@
 //! The data-plane HTTP proxy.
 //!
 //! The agent points its SDK at `http://127.0.0.1:8080/<upstream>` and
-//! authenticates with its *IAP* token. The proxy checks who it is, checks the
-//! ACL, writes an audit record, and only then swaps in the real credential.
+//! authenticates with its *IAP* token — or, better, with a workload token it
+//! exchanged that one for. The proxy checks who it is, checks that the
+//! credential presented covers this request at all, checks the ACL, writes an
+//! audit record, and only then swaps in the real credential.
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
@@ -40,6 +42,12 @@ const IAP_HEADERS: &[&str] = &["authorization", "x-iap-token", "x-iap-upstream",
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/_iap/health", get(health))
+        // Where an agent turns its standing grant into an hour of exactly what
+        // it needs. Reserved prefix, so it cannot collide with an upstream name.
+        .merge(crate::tokens::routes(
+            crate::tokens::PROXY_PREFIX,
+            Arc::clone(&state),
+        ))
         .fallback(handle)
         .with_state(state)
 }
@@ -133,21 +141,20 @@ async fn proxy(
         .with_record(record)
     })?;
 
-    let agent = state.agents.authenticate(&token).ok_or_else(|| {
+    // Whichever credential arrived, it resolves to one agent. A workload token
+    // also says what this run is for, which is checked below against the request.
+    let caller = state.authenticate(&token).map_err(|failure| {
         let mut record = AuditRecord::new("http", "denied");
-        record.agent = "<unknown>".into();
+        record.agent = failure.agent().unwrap_or("<unknown>").to_string();
         record.method = method.to_string();
         record.path = full_path.clone();
         record.decision = Some("deny".into());
-        record.rule = Some("<authentication>".into());
+        record.rule = Some(failure.rule());
         record.client = Some(peer.to_string());
-        Rejection::new(
-            StatusCode::UNAUTHORIZED,
-            "unknown_agent",
-            "the agent token is not recognised",
-        )
-        .with_record(record)
+        record.detail = failure.detail();
+        Rejection::new(failure.status(), failure.code(), failure.message()).with_record(record)
     })?;
+    let agent = caller.agent();
 
     // 2. Which upstream? `X-IAP-Upstream`, else the first path segment.
     let (upstream_name, upstream_path) = route(&parts.headers, &full_path).ok_or_else(|| {
@@ -172,6 +179,7 @@ async fn proxy(
     let mut record = AuditRecord::new("http", "request");
     record.agent = agent.id.clone();
     record.agent_name = Some(agent.display_name().to_string());
+    record.workload = caller.label();
     record.target = upstream_name.clone();
     record.method = method.to_string();
     record.path = upstream_path.clone();
@@ -199,7 +207,7 @@ async fn proxy(
         .with_record(record)
     })?;
 
-    if !agent_may_address(&agent, &upstream.name) {
+    if !agent_may_address(agent, &upstream.name) {
         record.decision = Some("deny".into());
         record.rule = Some("<agent-targets>".into());
         return Err(Box::new(
@@ -212,8 +220,30 @@ async fn proxy(
         ));
     }
 
-    // 3. What does the policy say?
+    // 3. Did this run ask for this? A workload token carries the scope its
+    // holder said it needed; anything outside that is refused before policy is
+    // consulted at all. A scope can only ever narrow — the ACL still runs next
+    // and can still say no — so this is least privilege the agent opted into,
+    // not a grant it gave itself.
     let access = AccessRequest::http(&agent.id, &upstream.name, method.as_str(), &upstream_path);
+    if !caller.permits(&access) {
+        record.decision = Some("deny".into());
+        record.rule = Some("<workload-scope>".into());
+        return Err(Box::new(
+            Rejection::new(
+                StatusCode::FORBIDDEN,
+                "scope_exceeded",
+                format!(
+                    "the workload token does not cover {} {} on `{}` — renew it with a \
+                     scope that does",
+                    method, upstream_path, upstream.name
+                ),
+            )
+            .with_record(record),
+        ));
+    }
+
+    // 4. What does the policy say?
     let decision = state.acl.evaluate(&access);
     record.rule = Some(decision.rule_label().to_string());
 
@@ -258,7 +288,7 @@ async fn proxy(
         }
     }
 
-    // 4. Allowed. Buffer the request body, then swap in the real credential.
+    // 5. Allowed. Buffer the request body, then swap in the real credential.
     let body_bytes = axum::body::to_bytes(body, state.config.server.max_body_bytes)
         .await
         .map_err(|_| {

@@ -64,6 +64,9 @@ pub struct ServerConfig {
     /// Binary used to resolve `op://` references.
     #[serde(default = "default_op_bin")]
     pub op_binary: String,
+    /// Short-lived, scope-bound workload tokens on top of agent identity.
+    #[serde(default)]
+    pub workload_identity: WorkloadIdentityConfig,
 }
 
 impl Default for ServerConfig {
@@ -77,8 +80,75 @@ impl Default for ServerConfig {
             upstream_connect_timeout_secs: default_connect_timeout(),
             max_body_bytes: default_max_body(),
             op_binary: default_op_bin(),
+            workload_identity: WorkloadIdentityConfig::default(),
         }
     }
+}
+
+/// How much of the data plane workload tokens are responsible for.
+///
+/// The agent token answers "who is this". It is long-lived, it is the same
+/// credential for every call an agent ever makes, and it says nothing about what
+/// this particular piece of work needs — so a copy of it is a copy of the
+/// agent's whole standing grant, for as long as nobody rotates it. A workload
+/// token answers "what is this run allowed to do, until when".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadMode {
+    /// No workload tokens. The agent token is the only credential the proxy takes.
+    Off,
+    /// Agents may mint workload tokens, and a bare agent token still works. The
+    /// migration setting: existing callers keep working while new ones move over.
+    #[default]
+    Optional,
+    /// The data plane takes workload tokens only. An agent token mints one and
+    /// does nothing else — it becomes a bootstrap credential rather than a key.
+    Required,
+}
+
+impl WorkloadMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkloadMode::Off => "off",
+            WorkloadMode::Optional => "optional",
+            WorkloadMode::Required => "required",
+        }
+    }
+
+    /// Whether tokens can be minted at all.
+    pub fn enabled(self) -> bool {
+        !matches!(self, WorkloadMode::Off)
+    }
+}
+
+impl std::fmt::Display for WorkloadMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadIdentityConfig {
+    #[serde(default)]
+    pub mode: WorkloadMode,
+    /// Default and maximum lifetime of a minted token. An agent may ask for
+    /// less; nothing gets it more.
+    #[serde(default = "default_workload_lifetime")]
+    pub lifetime_secs: u64,
+}
+
+impl Default for WorkloadIdentityConfig {
+    fn default() -> Self {
+        WorkloadIdentityConfig {
+            mode: WorkloadMode::default(),
+            lifetime_secs: default_workload_lifetime(),
+        }
+    }
+}
+
+fn default_workload_lifetime() -> u64 {
+    3600
 }
 
 impl ServerConfig {
@@ -512,6 +582,15 @@ impl Config {
             SecretRef::parse(reference).context("server.admin_token")?;
         }
 
+        let lifetime = self.server.workload_identity.lifetime_secs;
+        if !(MIN_WORKLOAD_LIFETIME_SECS..=MAX_WORKLOAD_LIFETIME_SECS).contains(&lifetime) {
+            bail!(
+                "server.workload_identity.lifetime_secs is {lifetime}; it must be between \
+                 {MIN_WORKLOAD_LIFETIME_SECS} and {MAX_WORKLOAD_LIFETIME_SECS} seconds — \
+                 shorter than a minute is clock skew, longer than an hour is not short-lived"
+            );
+        }
+
         // Whichever bound second would fail at startup, and which one that is
         // depends on ordering rather than on anything the operator wrote. Port
         // 0 is exempt: it asks the OS for any free port, so two of them are two
@@ -648,6 +727,11 @@ impl Config {
 /// Shortest assertion lifetime worth signing; below this, clock skew alone
 /// makes the token endpoint reject it.
 pub const MIN_ASSERTION_LIFETIME_SECS: u64 = 60;
+
+/// Bounds on a workload token's lifetime. The ceiling is the point of the thing:
+/// an identity that outlives the work it was minted for is an agent token again.
+pub const MIN_WORKLOAD_LIFETIME_SECS: u64 = 60;
+pub const MAX_WORKLOAD_LIFETIME_SECS: u64 = 3600;
 
 fn check_auth(auth: &AuthConfig, label: &str) -> Result<()> {
     for reference in auth.secret_refs() {
