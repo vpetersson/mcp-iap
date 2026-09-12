@@ -84,6 +84,19 @@ impl SecretRef {
     }
 }
 
+/// A reference rendered for display. Everything but `literal:` is a *pointer*
+/// to a credential and safe to print; `literal:` is the credential itself, so it
+/// is masked — `mcp-iap list` must never put a secret on a terminal.
+pub fn display_ref(raw: &str) -> String {
+    match SecretRef::parse(raw) {
+        Ok(SecretRef::Literal(_)) => "literal:***".to_string(),
+        Ok(_) => raw.to_string(),
+        // Unparseable references never resolve, but a pasted credential is
+        // exactly how one gets written, so mask it the way errors do.
+        Err(_) => redact_for_error(raw),
+    }
+}
+
 fn redact_for_error(raw: &str) -> String {
     // Never echo a possible credential back into logs or error strings.
     match raw.split_once(':') {

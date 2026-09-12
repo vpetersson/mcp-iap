@@ -339,6 +339,31 @@ impl AuthConfig {
         }
     }
 
+    /// The scheme's name as it is spelled in the config file.
+    pub fn scheme(&self) -> &'static str {
+        match self {
+            AuthConfig::None => "none",
+            AuthConfig::Bearer { .. } => "bearer",
+            AuthConfig::Header { .. } => "header",
+            AuthConfig::Basic { .. } => "basic",
+            AuthConfig::Query { .. } => "query",
+            AuthConfig::Oauth2ClientCredentials { .. } => "oauth2_client_credentials",
+            AuthConfig::ServiceAccountJwt { .. } => "service_account_jwt",
+        }
+    }
+
+    /// The scheme plus the one detail that tells two of the same kind apart —
+    /// which header, which query parameter, which user. `x-api-key` and
+    /// `Authorization` are both `header`, and which one it is matters.
+    pub fn describe(&self) -> String {
+        match self {
+            AuthConfig::Header { header, .. } => format!("header {header}"),
+            AuthConfig::Basic { username, .. } => format!("basic {username}"),
+            AuthConfig::Query { param, .. } => format!("query {param}"),
+            other => other.scheme().to_string(),
+        }
+    }
+
     /// True for schemes where the proxy mints a short-lived token of its own
     /// rather than forwarding a long-lived secret.
     pub fn mints_tokens(&self) -> bool {

@@ -9,6 +9,7 @@ use mcp_iap::audit;
 use mcp_iap::config::Config;
 use mcp_iap::identity;
 use mcp_iap::init::{self, InitOptions, Template};
+use mcp_iap::list::{Inventory, ListOptions, What};
 use mcp_iap::mcp;
 use mcp_iap::state::AppState;
 
@@ -87,6 +88,21 @@ enum Command {
         #[arg(long, env = "IAP_ADMIN_URL")]
         admin_url: Option<String>,
     },
+    /// Show every service this proxy exposes: agents, upstreams, MCP servers, ACL.
+    List {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Limit the view to one section. Omit for all of them.
+        #[arg(value_enum)]
+        what: Option<WhatArg>,
+        /// Show only what this agent can reach: the targets it may address and
+        /// the rules that match it.
+        #[arg(long, value_name = "ID")]
+        agent: Option<String>,
+        /// `table` for a terminal, `json` for an inventory script.
+        #[arg(long, value_enum, default_value_t = OutputArg::Table)]
+        output: OutputArg,
+    },
     /// Validate the policy file and resolve every secret reference in it.
     Check {
         #[command(flatten)]
@@ -103,6 +119,31 @@ enum Command {
     /// Inspect the audit log.
     #[command(subcommand)]
     Audit(AuditCommand),
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum WhatArg {
+    Agents,
+    Upstreams,
+    Mcp,
+    Acl,
+}
+
+impl From<WhatArg> for What {
+    fn from(arg: WhatArg) -> Self {
+        match arg {
+            WhatArg::Agents => What::Agents,
+            WhatArg::Upstreams => What::Upstreams,
+            WhatArg::Mcp => What::Mcp,
+            WhatArg::Acl => What::Acl,
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum OutputArg {
+    Table,
+    Json,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -220,6 +261,19 @@ fn main() -> Result<()> {
                 },
             ))
         }
+        Command::List {
+            config,
+            what,
+            agent,
+            output,
+        } => list_config(
+            &config.config,
+            &ListOptions {
+                what: what.map(What::from).unwrap_or_default(),
+                agent,
+            },
+            output,
+        ),
         Command::Check { config } => check(&config.config),
         Command::GenToken { id } => gen_token(&id),
         Command::HashToken { token } => {
@@ -404,6 +458,19 @@ fn write_admin_token(audit_path: &Path, token: &str) -> Result<PathBuf> {
     file.write_all(token.as_bytes())
         .with_context(|| format!("writing `{}`", path.display()))?;
     Ok(path)
+}
+
+/// `list` reads the policy file and nothing else — no daemon, no network, and
+/// no credential resolution, so it answers the same whether the proxy is up or
+/// down and cannot turn a reference into a secret on the way.
+fn list_config(path: &Path, options: &ListOptions, output: OutputArg) -> Result<()> {
+    let config = Config::load(path)?;
+    let inventory = Inventory::build(&config, options)?;
+    match output {
+        OutputArg::Table => print!("{}", inventory.render()),
+        OutputArg::Json => println!("{}", serde_json::to_string_pretty(&inventory)?),
+    }
+    Ok(())
 }
 
 fn check(path: &Path) -> Result<()> {

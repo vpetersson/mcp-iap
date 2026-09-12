@@ -183,6 +183,33 @@ impl Acl {
             .count()
     }
 
+    /// Positions of the rules whose agent glob matches, in file order — which is
+    /// match order, and therefore the policy. Used by `mcp-iap list --agent` to
+    /// show one agent's slice of the rule list without renumbering it.
+    pub fn rule_indices_for_agent(&self, agent: &str) -> Vec<usize> {
+        self.rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| rule.agent.is_match(agent))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// How many rules could ever apply to this agent against this target.
+    ///
+    /// Zero is the answer worth seeing: a target an agent is allowed to address
+    /// but that no rule ever names falls through to the default, which denies.
+    pub fn rules_for(&self, agent: &str, kind: Kind, target: &str) -> usize {
+        self.rules
+            .iter()
+            .filter(|rule| {
+                rule.kind.is_none_or(|k| k == kind)
+                    && rule.agent.is_match(agent)
+                    && rule.target.is_match(target)
+            })
+            .count()
+    }
+
     pub fn default_action(&self) -> Action {
         self.default
     }
