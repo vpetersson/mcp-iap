@@ -605,4 +605,47 @@ mod tests {
             .to_string();
         assert!(error.contains("MCP server"), "{error}");
     }
+
+    /// TLS is configured by hand in `[server.tls]`; enrolment is done by these
+    /// commands. A rewrite that dropped the block would take the proxy off
+    /// HTTPS as a side effect of adding an agent.
+    #[test]
+    fn enrolling_does_not_disturb_a_tls_block() {
+        let (_dir, path) = empty_policy();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let text = text.replace(
+            "[audit]",
+            "[server.tls]\ncert = \"file:/etc/mcp-iap/fullchain.pem\"\nkey = \"file:/etc/mcp-iap/key.pem\"\n\n[audit]",
+        );
+        std::fs::write(&path, &text).unwrap();
+
+        add_upstream(
+            &path,
+            "github",
+            "https://api.github.com",
+            &AuthSpec::None,
+            &[],
+        )
+        .unwrap();
+        add_rule(
+            &path,
+            None,
+            "*",
+            "http",
+            "github",
+            &["GET".into()],
+            &["/**".into()],
+            "allow",
+        )
+        .unwrap();
+        add_agent(&path, "ci", None, &["github".to_string()]).unwrap();
+
+        let config = load(&path);
+        let tls = config
+            .server
+            .tls
+            .expect("`[server.tls]` must survive enrolment");
+        assert_eq!(tls.cert, "file:/etc/mcp-iap/fullchain.pem");
+        assert_eq!(tls.key, "file:/etc/mcp-iap/key.pem");
+    }
 }

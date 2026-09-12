@@ -260,6 +260,44 @@ startup, so a locked vault fails the process rather than the tenth request.
 A bare value that is not one of these forms is rejected, and the error never
 echoes what you pasted.
 
+### TLS
+
+`[server.tls]` puts the proxy on HTTPS. Absent, it speaks plain HTTP exactly as
+before, so nothing existing changes by upgrading.
+
+```toml
+[server.tls]
+cert = "file:/etc/mcp-iap/fullchain.pem"     # PEM chain, leaf first
+key  = "op://Infra/mcp-iap tls/private key"  # PEM key: PKCS#8, PKCS#1 or SEC1
+```
+
+Both are *references*, resolved the same way every other credential is — a key
+is a credential, and this file stays safe to commit. Both are resolved **and
+parsed** at startup, before anything binds: a mismatched pair, a malformed PEM
+or a locked vault stops the process, rather than coming up healthy and failing
+the first handshake. `mcp-iap check` runs the same load.
+
+The control plane follows the proxy onto TLS without being named twice — it
+carries the admin token and is no less sensitive. Give it a certificate of its
+own only if it needs one:
+
+```toml
+[server.admin_tls]
+cert = "file:/etc/mcp-iap/admin-fullchain.pem"
+key  = "file:/etc/mcp-iap/admin-key.pem"
+```
+
+The listener offers ALPN `h2` and `http/1.1`, so an agent that speaks HTTP/2
+keeps speaking it. Versions and cipher suites are rustls's defaults and there is
+no knob for them: a policy file that can select TLS 1.0 is a liability.
+
+The MCP bridge reads the same policy file, so `mcp-iap mcp` finds the control
+plane on `https://` by itself and trusts that certificate — a self-signed
+loopback certificate needs no extra step, and verification is never turned off.
+
+Renewal still means a restart; there is no reload yet. Client certificates are
+not an identity here either — agents are still the bearer token.
+
 ## What is exposed
 
 `check` validates; `list` inventories. At twenty service accounts and MCP servers
@@ -348,13 +386,14 @@ Approvals are per agent too: a "remember for this session" answer is keyed by
 the agent *and* the exact request, so releasing a call for one agent never
 releases the same call for another.
 
-What this does **not** do yet, and all three matter more as the agent count
-grows:
+Agents off this host need `[server.tls]`; without it their tokens are on the
+wire in cleartext, and this is the process holding every upstream credential.
 
-- **No TLS on the listener.** The proxy speaks plain HTTP and binds loopback by
-  default. Agents on the same host are fine; agents on other hosts would put
-  their tokens on the wire in cleartext, so that deployment needs a TLS
-  terminator in front until the listener grows its own.
+What this does **not** do yet, and both matter more as the agent count grows:
+
+- **A renewed certificate means a restart.** `[server.tls]` is read once, at
+  startup — see § TLS — so every renewal costs the same outage the next bullet
+  describes.
 - **Changing the roster means a restart.** There is no reload: adding an agent,
   or revoking a leaked token, restarts the process and takes every other agent's
   in-flight request and MCP session with it. At one agent that is free. At
@@ -432,7 +471,9 @@ neither the upstream credential nor the agent token ever reaches the log.
 ## Control plane
 
 `admin_listen` (loopback, bearer token written to `admin-token` beside the audit
-log) exists for the console and the MCP bridge, and is useful directly:
+log) exists for the console and the MCP bridge, and is useful directly. With
+`[server.tls]` set it is on `https://` too — see § TLS — and these become
+`curl --cacert`:
 
 ```bash
 TOKEN=$(cat audit/admin-token)
@@ -463,8 +504,9 @@ What it does not give you, and you should know before relying on it:
   credential in its environment, and a same-user process can read that. It buys
   you policy and audit, not isolation. For a hard boundary, run the MCP server
   behind the daemon over HTTP, or in a container.
-- **No TLS on the listener.** Bind loopback, or put it behind something that
-  terminates TLS. The agent's token is a bearer token.
+- **The agent's token is a bearer token.** `[server.tls]` keeps it off the wire
+  in cleartext, but anyone holding a copy of it is that agent. There is no mTLS
+  client identity yet.
 - **The ACL sees method, path and tool name, not intent.** It cannot tell a
   reasonable `POST /v1/messages` from an expensive one. Use `ask` where the
   distinction matters.
@@ -475,20 +517,21 @@ What it does not give you, and you should know before relying on it:
 
 ## Not built yet
 
-Rate limits and spend caps per agent; hot config reload; TLS on the listener —
-those three are what a fleet sharing one proxy wants first, and § Multiple
-agents says what each one costs until then. Also: a decoupled TUI that attaches
-to an already-running daemon over the control plane; SSE streaming for the HTTP
-MCP transport (single JSON responses work, `data:` frames are parsed, long-lived
-streams are not); mTLS agent identity; native 1Password Connect (the CLI is
-shelled out to today). On service accounts specifically: only RSA keys are
-supported (Google issues RS256 keys, so this covers Google), and the GCP
-metadata server and workload identity federation are not wired up.
+Rate limits and spend caps per agent; hot config reload, which is also what a
+certificate renewal is waiting on — those two are what a fleet sharing one proxy
+wants next, and § Multiple agents says what each one costs until then. Also: a
+decoupled TUI that attaches to an already-running daemon over the control plane;
+SSE streaming for the HTTP MCP transport (single JSON responses work, `data:`
+frames are parsed, long-lived streams are not); mTLS agent identity; native
+1Password Connect (the CLI is shelled out to today). On service accounts
+specifically: only RSA keys are supported (Google issues RS256 keys, so this
+covers Google), and the GCP metadata server and workload identity federation are
+not wired up.
 
 ## Development
 
 ```bash
-cargo test        # 141 tests: unit + end-to-end through a real proxy
+cargo test        # 165 tests: unit + end-to-end through a real proxy, plain and over TLS
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

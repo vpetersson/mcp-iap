@@ -140,6 +140,10 @@ impl AppState {
         record.target = self.config.server.listen.to_string();
         record.detail = Some(serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
+            // Whether this process came up in cleartext is evidence, and the
+            // log is where evidence goes.
+            "tls": self.config.server.tls.is_some(),
+            "admin_tls": self.config.server.admin_tls_material().is_some(),
             "agents": self.agents.len(),
             "upstreams": self.config.upstreams.len(),
             "mcp_servers": self.config.mcp_servers.len(),

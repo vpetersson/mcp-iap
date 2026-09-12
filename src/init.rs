@@ -241,6 +241,12 @@ listen = "127.0.0.1:8080"        # where agents connect
 admin_listen = "127.0.0.1:8081"  # control plane: the TUI and the MCP bridge
 approval_timeout_secs = 120      # an unanswered `ask` denies after this
 
+# Loopback needs no TLS. An agent on another host does — uncomment, and the
+# control plane follows onto HTTPS with the same certificate.
+# [server.tls]
+# cert = "file:/etc/mcp-iap/fullchain.pem"
+# key = "op://Infra/mcp-iap tls/private key"
+
 [audit]
 path = "audit/iap-audit.jsonl"
 stderr = true
@@ -270,6 +276,12 @@ fn starter(agent: &str, token_hash: &str, secret: &str) -> String {
 listen = "127.0.0.1:8080"        # where agents connect
 admin_listen = "127.0.0.1:8081"  # control plane: the TUI and the MCP bridge
 approval_timeout_secs = 120      # an unanswered `ask` denies after this
+
+# Loopback needs no TLS. An agent on another host does — uncomment, and the
+# control plane follows onto HTTPS with the same certificate.
+# [server.tls]
+# cert = "file:/etc/mcp-iap/fullchain.pem"
+# key = "op://Infra/mcp-iap tls/private key"
 
 [audit]
 path = "audit/iap-audit.jsonl"
@@ -664,5 +676,25 @@ mod tests {
         })
         .unwrap();
         assert!(path.exists());
+    }
+
+    /// The default template is the one most people get, so the TLS hint has to
+    /// be in it — not only in `starter`.
+    #[test]
+    fn the_default_template_says_how_to_turn_on_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iap.toml");
+        init(&InitOptions {
+            path: path.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# [server.tls]"),
+            "no TLS hint in the default file"
+        );
+        // Commented out, so the file it writes still starts a proxy as-is.
+        assert!(load(&text).server.tls.is_none());
     }
 }
