@@ -297,7 +297,18 @@ pub enum AuthConfig {
         prefix: Option<String>,
     },
     /// `Authorization: Basic base64(username:secret)`
-    Basic { username: String, secret: String },
+    ///
+    /// `username` is a plain value; `username_secret` is a *reference*, for the
+    /// APIs that put the credential in the user field — Graylog authenticates
+    /// an access token as `<token>:token`, and spelling that with a plain
+    /// `username` would put the token in the policy file.
+    Basic {
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        username_secret: Option<String>,
+        secret: String,
+    },
     /// Credential in the query string, e.g. `?key=<secret>`.
     Query { param: String, secret: String },
     /// OAuth2 client-credentials grant; the access token is fetched and cached here.
@@ -352,8 +363,16 @@ impl AuthConfig {
             AuthConfig::None => vec![],
             AuthConfig::Bearer { secret }
             | AuthConfig::Header { secret, .. }
-            | AuthConfig::Basic { secret, .. }
             | AuthConfig::Query { secret, .. } => vec![secret.as_str()],
+            AuthConfig::Basic {
+                username_secret,
+                secret,
+                ..
+            } => username_secret
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once(secret.as_str()))
+                .collect(),
             AuthConfig::Oauth2ClientCredentials { client_secret, .. } => {
                 vec![client_secret.as_str()]
             }
@@ -388,7 +407,17 @@ impl AuthConfig {
     pub fn describe(&self) -> String {
         match self {
             AuthConfig::Header { header, .. } => format!("header {header}"),
-            AuthConfig::Basic { username, .. } => format!("basic {username}"),
+            AuthConfig::Basic {
+                username,
+                username_secret,
+                ..
+            } => match (username, username_secret) {
+                // The user field is the credential here, so naming it would
+                // print a secret reference in a column about the scheme.
+                (_, Some(_)) => "basic <secret>".to_string(),
+                (Some(username), None) => format!("basic {username}"),
+                (None, None) => "basic".to_string(),
+            },
             AuthConfig::Query { param, .. } => format!("query {param}"),
             other => other.scheme().to_string(),
         }
@@ -696,7 +725,22 @@ impl Config {
 pub const MIN_ASSERTION_LIFETIME_SECS: u64 = 60;
 
 fn check_auth(auth: &AuthConfig, label: &str) -> Result<()> {
+    // The password half of `<token>:token` is a scheme constant, not a
+    // credential — warning about it every startup trains the operator to
+    // ignore the warning that does matter.
+    let constant_basic_password = match auth {
+        AuthConfig::Basic {
+            username_secret: Some(_),
+            secret,
+            ..
+        } => Some(secret.as_str()),
+        _ => None,
+    };
     for reference in auth.secret_refs() {
+        if Some(reference) == constant_basic_password {
+            SecretRef::parse(reference).with_context(|| format!("{label}: auth secret"))?;
+            continue;
+        }
         let parsed =
             SecretRef::parse(reference).with_context(|| format!("{label}: auth secret"))?;
         if parsed.is_inline() {
@@ -708,6 +752,27 @@ fn check_auth(auth: &AuthConfig, label: &str) -> Result<()> {
     }
     if let AuthConfig::Oauth2ClientCredentials { token_url, .. } = auth {
         url::Url::parse(token_url).with_context(|| format!("{label}: token_url"))?;
+    }
+
+    if let AuthConfig::Basic {
+        username,
+        username_secret,
+        ..
+    } = auth
+    {
+        // Both would be two different user fields with no rule for which wins;
+        // neither sends `:secret` and authenticates as nobody.
+        match (username, username_secret) {
+            (Some(_), Some(_)) => bail!(
+                "{label}: set either `username` or `username_secret`, not both — \
+                 `username_secret` is for APIs whose user field *is* the credential"
+            ),
+            (None, None) => bail!(
+                "{label}: basic auth needs `username`, or `username_secret` for an API \
+                 like Graylog that authenticates a token as `<token>:token`"
+            ),
+            _ => {}
+        }
     }
 
     if let AuthConfig::ServiceAccountJwt {

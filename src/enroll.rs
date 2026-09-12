@@ -58,12 +58,37 @@ pub enum AuthSpec {
         prefix: Option<String>,
     },
     Basic {
-        username: String,
+        /// A plain user field, or `None` when the user field is itself the
+        /// credential and `username_secret` carries the reference.
+        username: Option<String>,
+        username_secret: Option<String>,
         secret: String,
     },
     Query {
         param: String,
         secret: String,
+    },
+    /// The two schemes that mint a short-lived token instead of forwarding a
+    /// long-lived secret. They were reachable only by hand-editing the file,
+    /// which meant the credential the proxy handles best — a Google service
+    /// account — was the one the CLI could not enrol.
+    Oauth2ClientCredentials {
+        token_url: String,
+        client_id: String,
+        client_secret: String,
+        scope: Option<String>,
+        audience: Option<String>,
+    },
+    ServiceAccountJwt {
+        key_file: Option<String>,
+        issuer: Option<String>,
+        private_key: Option<String>,
+        key_id: Option<String>,
+        token_url: Option<String>,
+        audience: Option<String>,
+        scopes: Vec<String>,
+        subject: Option<String>,
+        lifetime_secs: Option<u64>,
     },
 }
 
@@ -141,23 +166,7 @@ pub fn add_upstream(
 ) -> Result<()> {
     check_id(name, "upstream name")?;
     check_base_url(base_url)?;
-    if let Some(reference) = auth_secret(auth) {
-        // Catch `--secret ANTHROPIC_API_KEY` — a bare name is not a reference,
-        // and left alone it would be resolved as a literal and sent upstream.
-        // Deliberately not echoing the value: `--secret sk-live-…` is exactly
-        // the mistake this catches, and `SecretRef::parse` redacts it for the
-        // same reason. Naming the flag is as much as can be said safely.
-        let parsed = SecretRef::parse(reference)
-            .context("`--secret` takes a credential *reference*, not the credential")?;
-        if parsed.is_inline() {
-            // Same refusal `init` makes: the policy file is meant to be
-            // committable, and `literal:` is the one thing that would stop it.
-            bail!(
-                "`literal:` puts the credential in the policy file itself — use `op://`, \
-                 `env:` or `file:` so the file stays safe to commit"
-            );
-        }
-    }
+    check_secret_refs(auth)?;
 
     let mut document = read(path)?;
     let existing = document_config(&document)?;
@@ -178,6 +187,20 @@ pub fn add_upstream(
         );
     }
 
+    append(
+        &mut document,
+        "upstreams",
+        upstream_entry(name, base_url, auth, headers),
+    );
+    save(path, document)
+}
+
+fn upstream_entry(
+    name: &str,
+    base_url: &str,
+    auth: &AuthSpec,
+    headers: &[(String, String)],
+) -> Table {
     let mut entry = Table::new();
     entry["name"] = toml_edit::value(name);
     entry["base_url"] = toml_edit::value(base_url);
@@ -189,9 +212,114 @@ pub fn add_upstream(
         }
         entry["headers"] = toml_edit::value(table);
     }
+    entry
+}
 
-    append(&mut document, "upstreams", entry);
+/// An MCP server as the CLI accepts it: a child process to spawn, or a remote
+/// endpoint to relay to.
+#[derive(Debug, Clone)]
+pub enum McpTransportSpec {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        /// Child environment. Values are secret *references*, resolved inside
+        /// the proxy — the same rule the rest of the file follows.
+        env: Vec<(String, String)>,
+        cwd: Option<String>,
+    },
+    Http {
+        url: String,
+    },
+}
+
+/// Add `[[mcp_servers]]`. Without this an MCP server could only be enrolled by
+/// hand-editing TOML, which is the one thing the enrolment commands exist to
+/// avoid — and MCP is where most of the interesting credentials now live.
+pub fn add_mcp_server(
+    path: &Path,
+    name: &str,
+    transport: &McpTransportSpec,
+    auth: &AuthSpec,
+) -> Result<()> {
+    check_id(name, "mcp server name")?;
+    check_secret_refs(auth)?;
+    if let McpTransportSpec::Stdio { env, .. } = transport {
+        for (key, reference) in env {
+            let parsed = SecretRef::parse(reference)
+                .with_context(|| format!("`--env {key}=…` takes a credential reference"))?;
+            if parsed.is_inline() {
+                bail!(
+                    "`literal:` puts the credential in the policy file itself — use `op://`, \
+                     `env:` or `file:` so the file stays safe to commit"
+                );
+            }
+        }
+    }
+    if let McpTransportSpec::Http { url } = transport {
+        check_base_url(url)?;
+    }
+
+    let mut document = read(path)?;
+    let existing = document_config(&document)?;
+    if existing
+        .mcp_servers
+        .iter()
+        .any(|server| server.name == name)
+    {
+        bail!("`{}` already has an MCP server `{name}`", path.display());
+    }
+    // One namespace: `/{name}/…` routes to an upstream, and the ACL `target`
+    // and the agent's `targets` are matched against the same set of names.
+    if existing.upstreams.iter().any(|up| up.name == name) {
+        bail!(
+            "`{}` already has an upstream named `{name}`, and both share one namespace",
+            path.display()
+        );
+    }
+
+    append(
+        &mut document,
+        "mcp_servers",
+        mcp_entry(name, transport, auth),
+    );
     save(path, document)
+}
+
+fn mcp_entry(name: &str, transport: &McpTransportSpec, auth: &AuthSpec) -> Table {
+    let mut entry = Table::new();
+    entry["name"] = toml_edit::value(name);
+    match transport {
+        McpTransportSpec::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => {
+            entry["transport"] = toml_edit::value("stdio");
+            entry["command"] = toml_edit::value(command.as_str());
+            if !args.is_empty() {
+                entry["args"] = toml_edit::value(string_array(args));
+            }
+            if !env.is_empty() {
+                let mut table = toml_edit::InlineTable::new();
+                for (key, reference) in env {
+                    table.insert(key, Value::from(reference.as_str()));
+                }
+                entry["env"] = toml_edit::value(table);
+            }
+            if let Some(cwd) = cwd {
+                entry["cwd"] = toml_edit::value(cwd.as_str());
+            }
+        }
+        McpTransportSpec::Http { url } => {
+            entry["transport"] = toml_edit::value("http");
+            entry["url"] = toml_edit::value(url.as_str());
+        }
+    }
+    if !matches!(auth, AuthSpec::None) {
+        entry["auth"] = toml_edit::value(auth_value(auth));
+    }
+    entry
 }
 
 /// Add `[[acl]]`. Appended last, because first match wins and an earlier rule
@@ -208,7 +336,21 @@ pub fn add_rule(
     action: &str,
 ) -> Result<()> {
     let mut document = read(path)?;
+    let entry = rule_entry(name, agent, kind, target, methods, paths, action);
+    append(&mut document, "acl", entry);
+    save(path, document)
+}
 
+#[allow(clippy::too_many_arguments)]
+fn rule_entry(
+    name: Option<&str>,
+    agent: &str,
+    kind: &str,
+    target: &str,
+    methods: &[String],
+    paths: &[String],
+    action: &str,
+) -> Table {
     let mut entry = Table::new();
     if let Some(name) = name {
         entry["name"] = toml_edit::value(name);
@@ -219,9 +361,80 @@ pub fn add_rule(
     entry["methods"] = toml_edit::value(string_array(methods));
     entry["paths"] = toml_edit::value(string_array(paths));
     entry["action"] = toml_edit::value(action);
+    entry
+}
 
-    append(&mut document, "acl", entry);
-    save(path, document)
+/// A service to render without writing it, for `profile add --dry-run`.
+pub enum ServiceSpec<'a> {
+    Upstream {
+        base_url: &'a str,
+    },
+    McpHttp {
+        url: &'a str,
+    },
+    McpStdio {
+        command: &'a str,
+        args: &'a [String],
+        env: &'a [(String, String)],
+    },
+}
+
+/// The exact TOML `add_upstream` / `add_mcp_server` would append. Built from
+/// the same entry builders they use, so a dry run cannot promise one thing and
+/// the write produce another.
+pub fn render_service(name: &str, spec: ServiceSpec<'_>, auth: &AuthSpec) -> String {
+    let (key, entry) = match spec {
+        ServiceSpec::Upstream { base_url } => {
+            ("upstreams", upstream_entry(name, base_url, auth, &[]))
+        }
+        ServiceSpec::McpHttp { url } => (
+            "mcp_servers",
+            mcp_entry(
+                name,
+                &McpTransportSpec::Http {
+                    url: url.to_string(),
+                },
+                auth,
+            ),
+        ),
+        ServiceSpec::McpStdio { command, args, env } => (
+            "mcp_servers",
+            mcp_entry(
+                name,
+                &McpTransportSpec::Stdio {
+                    command: command.to_string(),
+                    args: args.to_vec(),
+                    env: env.to_vec(),
+                    cwd: None,
+                },
+                auth,
+            ),
+        ),
+    };
+    render(key, entry)
+}
+
+/// The exact TOML `add_rule` would append.
+#[allow(clippy::too_many_arguments)]
+pub fn render_rule(
+    name: Option<&str>,
+    agent: &str,
+    kind: &str,
+    target: &str,
+    methods: &[String],
+    paths: &[String],
+    action: &str,
+) -> String {
+    render(
+        "acl",
+        rule_entry(name, agent, kind, target, methods, paths, action),
+    )
+}
+
+fn render(key: &str, entry: Table) -> String {
+    let mut document = DocumentMut::new();
+    append(&mut document, key, entry);
+    document.to_string()
 }
 
 /// Position in the rule list, so the caller can say where a new rule landed —
@@ -269,14 +482,82 @@ fn save(path: &Path, document: DocumentMut) -> Result<()> {
     std::fs::write(path, text).with_context(|| format!("writing `{}`", path.display()))
 }
 
-fn auth_secret(auth: &AuthSpec) -> Option<&str> {
+/// Every credential *reference* the spec carries. All of them are checked, not
+/// just the first: `--username-secret op://… --secret literal:token` would
+/// otherwise slip a literal past the check that exists to stop exactly that.
+fn auth_secrets(auth: &AuthSpec) -> Vec<&str> {
     match auth {
-        AuthSpec::None => None,
+        AuthSpec::None => vec![],
         AuthSpec::Bearer { secret }
         | AuthSpec::Header { secret, .. }
-        | AuthSpec::Basic { secret, .. }
-        | AuthSpec::Query { secret, .. } => Some(secret),
+        | AuthSpec::Query { secret, .. } => vec![secret.as_str()],
+        AuthSpec::Basic {
+            username_secret,
+            secret,
+            ..
+        } => username_secret
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(secret.as_str()))
+            .collect(),
+        AuthSpec::Oauth2ClientCredentials { client_secret, .. } => vec![client_secret.as_str()],
+        AuthSpec::ServiceAccountJwt {
+            key_file,
+            private_key,
+            ..
+        } => key_file
+            .iter()
+            .chain(private_key.iter())
+            .map(String::as_str)
+            .collect(),
     }
+}
+
+/// Reject a credential where a *reference* belongs, before anything is written.
+fn check_secret_refs(auth: &AuthSpec) -> Result<()> {
+    // `<token>:token` — Graylog, and Graylog's session variant — puts the
+    // credential in the user field and a documented constant in the password.
+    // That constant is not a secret, and refusing `literal:token` here would
+    // leave the scheme expressible only by writing the real token into the
+    // file: the exact outcome this check exists to prevent.
+    if let AuthSpec::Basic {
+        username_secret: Some(reference),
+        secret,
+        ..
+    } = auth
+    {
+        let parsed = SecretRef::parse(reference)
+            .context("`--username-secret` takes a credential *reference*, not the credential")?;
+        if parsed.is_inline() {
+            bail!(
+                "`literal:` in `--username-secret` puts the credential in the policy file \
+                 itself — use `op://`, `env:` or `file:`"
+            );
+        }
+        // The password is still parsed, so a bare word is still caught.
+        SecretRef::parse(secret)
+            .context("`--secret` takes a credential *reference*, not the credential")?;
+        return Ok(());
+    }
+
+    for reference in auth_secrets(auth) {
+        // Catch `--secret ANTHROPIC_API_KEY` — a bare name is not a reference,
+        // and left alone it would be resolved as a literal and sent upstream.
+        // Deliberately not echoing the value: `--secret sk-live-…` is exactly
+        // the mistake this catches, and `SecretRef::parse` redacts it for the
+        // same reason. Naming the flag is as much as can be said safely.
+        let parsed = SecretRef::parse(reference)
+            .context("`--secret` takes a credential *reference*, not the credential")?;
+        if parsed.is_inline() {
+            // Same refusal `init` makes: the policy file is meant to be
+            // committable, and `literal:` is the one thing that would stop it.
+            bail!(
+                "`literal:` puts the credential in the policy file itself — use `op://`, \
+                 `env:` or `file:` so the file stays safe to commit"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn auth_value(auth: &AuthSpec) -> Value {
@@ -301,15 +582,82 @@ fn auth_value(auth: &AuthSpec) -> Value {
                 table.insert("prefix", prefix.as_str().into());
             }
         }
-        AuthSpec::Basic { username, secret } => {
+        AuthSpec::Basic {
+            username,
+            username_secret,
+            secret,
+        } => {
             table.insert("type", "basic".into());
-            table.insert("username", username.as_str().into());
+            if let Some(username) = username {
+                table.insert("username", username.as_str().into());
+            }
+            if let Some(reference) = username_secret {
+                table.insert("username_secret", reference.as_str().into());
+            }
             table.insert("secret", secret.as_str().into());
         }
         AuthSpec::Query { param, secret } => {
             table.insert("type", "query".into());
             table.insert("param", param.as_str().into());
             table.insert("secret", secret.as_str().into());
+        }
+        AuthSpec::Oauth2ClientCredentials {
+            token_url,
+            client_id,
+            client_secret,
+            scope,
+            audience,
+        } => {
+            table.insert("type", "oauth2_client_credentials".into());
+            table.insert("token_url", token_url.as_str().into());
+            table.insert("client_id", client_id.as_str().into());
+            table.insert("client_secret", client_secret.as_str().into());
+            if let Some(scope) = scope {
+                table.insert("scope", scope.as_str().into());
+            }
+            if let Some(audience) = audience {
+                table.insert("audience", audience.as_str().into());
+            }
+        }
+        AuthSpec::ServiceAccountJwt {
+            key_file,
+            issuer,
+            private_key,
+            key_id,
+            token_url,
+            audience,
+            scopes,
+            subject,
+            lifetime_secs,
+        } => {
+            table.insert("type", "service_account_jwt".into());
+            if let Some(value) = key_file {
+                table.insert("key_file", value.as_str().into());
+            }
+            if let Some(value) = issuer {
+                table.insert("issuer", value.as_str().into());
+            }
+            if let Some(value) = private_key {
+                table.insert("private_key", value.as_str().into());
+            }
+            if let Some(value) = key_id {
+                table.insert("key_id", value.as_str().into());
+            }
+            if let Some(value) = token_url {
+                table.insert("token_url", value.as_str().into());
+            }
+            if let Some(value) = audience {
+                table.insert("audience", value.as_str().into());
+            }
+            if !scopes.is_empty() {
+                table.insert("scopes", Value::Array(string_array(scopes)));
+            }
+            if let Some(value) = subject {
+                table.insert("subject", value.as_str().into());
+            }
+            if let Some(value) = lifetime_secs {
+                table.insert("lifetime_secs", Value::from(*value as i64));
+            }
         }
     }
     Value::InlineTable(table)
@@ -604,6 +952,230 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("MCP server"), "{error}");
+    }
+
+    #[test]
+    fn a_service_account_can_be_enrolled_without_editing_the_file() {
+        // The scheme the proxy handles best used to be the one the CLI could
+        // not express, so a Google upstream meant hand-writing TOML.
+        let (_dir, path) = empty_policy();
+        add_upstream(
+            &path,
+            "gsc",
+            "https://searchconsole.googleapis.com",
+            &AuthSpec::ServiceAccountJwt {
+                key_file: Some("op://Private/GCP/credential".into()),
+                issuer: None,
+                private_key: None,
+                key_id: None,
+                token_url: None,
+                audience: None,
+                scopes: vec!["https://www.googleapis.com/auth/webmasters.readonly".into()],
+                subject: Some("person@example.com".into()),
+                lifetime_secs: None,
+            },
+            &[],
+        )
+        .unwrap();
+
+        let config = load(&path);
+        config.validate().unwrap();
+        match &config.upstreams[0].auth {
+            crate::config::AuthConfig::ServiceAccountJwt {
+                key_file,
+                scopes,
+                subject,
+                ..
+            } => {
+                assert_eq!(key_file.as_deref(), Some("op://Private/GCP/credential"));
+                assert_eq!(scopes.len(), 1);
+                assert_eq!(subject.as_deref(), Some("person@example.com"));
+            }
+            other => panic!("expected a service account, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_mcp_server_can_be_enrolled_without_editing_the_file() {
+        let (_dir, path) = empty_policy();
+        add_mcp_server(
+            &path,
+            "posthog",
+            &McpTransportSpec::Http {
+                url: "https://mcp.posthog.com/mcp".into(),
+            },
+            &AuthSpec::Bearer {
+                secret: "op://Private/PostHog/key".into(),
+            },
+        )
+        .unwrap();
+        add_mcp_server(
+            &path,
+            "local-notes",
+            &McpTransportSpec::Stdio {
+                command: "notes-mcp".into(),
+                args: vec!["--stdio".into()],
+                env: vec![("NOTES_TOKEN".into(), "env:NOTES_TOKEN".into())],
+                cwd: None,
+            },
+            &AuthSpec::None,
+        )
+        .unwrap();
+
+        let config = load(&path);
+        config.validate().unwrap();
+        assert_eq!(config.mcp_servers.len(), 2);
+        assert_eq!(
+            config.mcp_servers[0].url.as_deref(),
+            Some("https://mcp.posthog.com/mcp")
+        );
+        assert_eq!(
+            config.mcp_servers[1]
+                .env
+                .get("NOTES_TOKEN")
+                .map(String::as_str),
+            Some("env:NOTES_TOKEN")
+        );
+    }
+
+    #[test]
+    fn an_mcp_name_already_taken_by_an_upstream_is_refused() {
+        // Both are addressed as `/{name}/…` and both are matched by the same
+        // ACL `target`, so the collision is not cosmetic.
+        let (_dir, path) = empty_policy();
+        add_upstream(
+            &path,
+            "github",
+            "https://api.github.com",
+            &AuthSpec::None,
+            &[],
+        )
+        .unwrap();
+        let error = add_mcp_server(
+            &path,
+            "github",
+            &McpTransportSpec::Http {
+                url: "https://example.com/mcp".into(),
+            },
+            &AuthSpec::None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("upstream"), "{error}");
+    }
+
+    #[test]
+    fn a_credential_in_an_mcp_child_environment_must_be_a_reference() {
+        let (_dir, path) = empty_policy();
+        let error = add_mcp_server(
+            &path,
+            "leaky",
+            &McpTransportSpec::Stdio {
+                command: "server".into(),
+                args: vec![],
+                env: vec![("TOKEN".into(), "literal:ghp_realtoken".into())],
+                cwd: None,
+            },
+            &AuthSpec::None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("literal:"), "{error}");
+        assert!(
+            !error.contains("ghp_realtoken"),
+            "the error echoed the credential: {error}"
+        );
+    }
+
+    #[test]
+    fn basic_auth_can_put_the_credential_in_the_user_field() {
+        // Graylog's `<token>:token`. The token stays a reference; the password
+        // is a documented constant and is allowed to be a literal.
+        let (_dir, path) = empty_policy();
+        add_upstream(
+            &path,
+            "graylog",
+            "https://graylog.example.com/api",
+            &AuthSpec::Basic {
+                username: None,
+                username_secret: Some("op://Private/Graylog/token".into()),
+                secret: "literal:token".into(),
+            },
+            &[],
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("username_secret = \"op://Private/Graylog/token\""));
+        load(&path).validate().unwrap();
+    }
+
+    #[test]
+    fn a_literal_in_the_user_field_is_still_refused() {
+        // The exception is narrow: the *password* may be a scheme constant.
+        // The user field is where the credential actually is.
+        let (_dir, path) = empty_policy();
+        let error = add_upstream(
+            &path,
+            "graylog",
+            "https://graylog.example.com/api",
+            &AuthSpec::Basic {
+                username: None,
+                username_secret: Some("literal:the-real-token".into()),
+                secret: "literal:token".into(),
+            },
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--username-secret"), "{error}");
+        assert!(!error.contains("the-real-token"), "{error}");
+    }
+
+    #[test]
+    fn basic_auth_with_neither_user_field_is_rejected_by_validate() {
+        let (_dir, path) = empty_policy();
+        let error = add_upstream(
+            &path,
+            "broken",
+            "https://example.com",
+            &AuthSpec::Basic {
+                username: None,
+                username_secret: None,
+                secret: "env:PASSWORD".into(),
+            },
+            &[],
+        )
+        .unwrap_err();
+        // The refusal comes from `validate()`, so it is in the cause chain
+        // rather than the top-level "the edit produced a policy file…".
+        let error = format!("{error:#}");
+        assert!(error.contains("username"), "{error}");
+    }
+
+    #[test]
+    fn the_dry_run_renderer_matches_what_would_be_written() {
+        // If these drift, `--dry-run` becomes a promise the write does not keep.
+        let (_dir, path) = empty_policy();
+        let auth = AuthSpec::Bearer {
+            secret: "env:TOKEN".into(),
+        };
+        let rendered = render_service(
+            "svc",
+            ServiceSpec::Upstream {
+                base_url: "https://x.example.com",
+            },
+            &auth,
+        );
+        add_upstream(&path, "svc", "https://x.example.com", &auth, &[]).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        for line in rendered.lines().filter(|line| !line.trim().is_empty()) {
+            assert!(
+                written.contains(line),
+                "`--dry-run` printed a line the write did not produce: {line}"
+            );
+        }
     }
 
     /// TLS is configured by hand in `[server.tls]`; enrolment is done by these
