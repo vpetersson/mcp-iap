@@ -96,10 +96,22 @@ impl CredentialInjector {
                 };
                 set_header(request, header, &rendered)?;
             }
-            AuthConfig::Basic { username, secret } => {
+            AuthConfig::Basic {
+                username,
+                username_secret,
+                secret,
+            } => {
+                // `username_secret` resolves like any other reference, so the
+                // user field can be the credential without the policy file
+                // holding it. `validate()` has already rejected both-or-neither.
+                let user = match (username, username_secret) {
+                    (Some(username), _) => username.clone(),
+                    (None, Some(reference)) => self.resolve(reference)?.expose().to_string(),
+                    (None, None) => String::new(),
+                };
                 let value = self.resolve(secret)?;
                 let encoded = base64::engine::general_purpose::STANDARD
-                    .encode(format!("{username}:{}", value.expose()));
+                    .encode(format!("{user}:{}", value.expose()));
                 set_header(request, "authorization", &format!("Basic {encoded}"))?;
             }
             AuthConfig::Query { param, secret } => {
@@ -447,7 +459,8 @@ mod tests {
             .apply(
                 "u",
                 &AuthConfig::Basic {
-                    username: "user".into(),
+                    username: Some("user".into()),
+                    username_secret: None,
                     secret: "literal:sk-real".into(),
                 },
                 &mut req,
