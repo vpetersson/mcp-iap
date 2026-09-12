@@ -22,15 +22,45 @@ use crate::identity::agent_may_address;
 use crate::state::AppState;
 
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    // Operator routes authenticate in a `route_layer`, not in the handlers.
+    // Handler-body checks run *after* axum has already run the extractors, so
+    // `POST /decide` with a bad body used to answer an anonymous caller with a
+    // deserialization error naming the fields it expected — the body was parsed
+    // before anyone asked who was calling. A layer runs first, so an unproven
+    // caller gets 401 and nothing else.
+    let operator = Router::new()
         .route("/status", get(status))
         .route("/pending", get(pending))
         .route("/decide", post(decide))
         .route("/events", get(events))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin,
+        ));
+
+    // These two are the MCP bridge's, and authenticate as an *agent*; they do
+    // their own check because the credential is a different one.
+    let bridge = Router::new()
         .route("/authorize", post(authorize))
-        .route("/event", post(record_event))
+        .route("/event", post(record_event));
+
+    Router::new()
+        .route("/health", get(health))
+        .merge(operator)
+        .merge(bridge)
         .with_state(state)
+}
+
+/// The admin-token gate, as a layer so it precedes every extractor.
+async fn require_admin(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(response) = reject_non_admin(&state, request.headers()) {
+        return response;
+    }
+    next.run(request).await
 }
 
 /// Unauthenticated on purpose: it exposes nothing but the fact that we are up,
@@ -86,10 +116,7 @@ struct StatusBody {
     has_approver: bool,
 }
 
-async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Some(response) = reject_non_admin(&state, &headers) {
-        return response;
-    }
+async fn status(State(state): State<Arc<AppState>>) -> Response {
     Json(StatusBody {
         version: env!("CARGO_PKG_VERSION"),
         listen: state.config.server.listen.to_string(),
@@ -105,10 +132,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     .into_response()
 }
 
-async fn pending(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Some(response) = reject_non_admin(&state, &headers) {
-        return response;
-    }
+async fn pending(State(state): State<Arc<AppState>>) -> Response {
     // Polling the queue counts as watching it, so `curl` alone is enough to
     // answer an `ask` without running the TUI.
     state.broker.note_poll();
@@ -125,14 +149,7 @@ struct DecideBody {
     remember: bool,
 }
 
-async fn decide(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<DecideBody>,
-) -> Response {
-    if let Some(response) = reject_non_admin(&state, &headers) {
-        return response;
-    }
+async fn decide(State(state): State<Arc<AppState>>, Json(body): Json<DecideBody>) -> Response {
     let delivered = match &body.id {
         Some(id) => state.broker.decide(id, body.verdict, body.remember),
         None => state.broker.decide_first(body.verdict, body.remember),
@@ -146,12 +163,8 @@ async fn decide(
 
 async fn events(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Some(response) = reject_non_admin(&state, &headers) {
-        return response;
-    }
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
