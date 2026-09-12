@@ -197,6 +197,26 @@ upstream may go silent mid-response. A token-by-token LLM response can stream fo
 as long as it likes provided it keeps arriving. `upstream_connect_timeout_secs`
 (default 30) bounds establishing the connection.
 
+### Listening addresses
+
+`server.listen` is where agents connect; `server.admin_listen` is the control
+plane the TUI and the MCP bridge use. Both live in the policy file, and both can
+be overridden at run time by a deployment that does not own that file:
+
+```bash
+mcp-iap run --listen 0.0.0.0:8080       # full address
+mcp-iap run --listen 9000               # bare port: keeps the configured interface
+mcp-iap run --admin-listen off          # no control plane, so no TUI and no bridge
+IAP_LISTEN=0.0.0.0:8080 mcp-iap run     # same, for a container or a unit file
+```
+
+A flag beats `IAP_LISTEN` / `IAP_ADMIN_LISTEN`, which beat the file. A bare port
+moves the port and never the interface — `--listen 9000` against a loopback
+config stays on loopback — because a process holding live credentials should
+reach every interface only when someone spells that out. The proxy and the
+control plane may not share an address; that is rejected at startup rather than
+arriving later as whichever bind happened to lose.
+
 ### Where secrets come from
 
 `op://vault/item/field` (1Password CLI), `env:NAME`, `file:/path`, and
@@ -391,7 +411,7 @@ metadata server and workload identity federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 98 tests: unit + end-to-end through a real proxy
+cargo test        # 105 tests: unit + end-to-end through a real proxy
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

@@ -81,6 +81,57 @@ impl Default for ServerConfig {
     }
 }
 
+impl ServerConfig {
+    /// Apply a `--listen` / `IAP_LISTEN` override to the proxy address.
+    ///
+    /// A full `HOST:PORT` replaces the address outright. A bare port moves the
+    /// port and keeps whichever interface the file chose, so an override can
+    /// never widen a loopback bind to every interface by accident — exposing
+    /// this process has to be spelled out.
+    pub fn override_listen(&mut self, spec: &str) -> Result<()> {
+        self.listen = parse_bind(spec, self.listen)?;
+        Ok(())
+    }
+
+    /// Apply an `--admin-listen` / `IAP_ADMIN_LISTEN` override. `off` turns the
+    /// control plane off, which is how a deployment with no operator console
+    /// and no MCP bridge closes that port.
+    pub fn override_admin_listen(&mut self, spec: &str) -> Result<()> {
+        let spec = spec.trim();
+        if spec.eq_ignore_ascii_case("off")
+            || spec.eq_ignore_ascii_case("none")
+            || spec.eq_ignore_ascii_case("false")
+        {
+            self.admin_listen = None;
+            return Ok(());
+        }
+        // With the control plane off in the file, a bare port has no interface
+        // to inherit; fall back to the default rather than guessing the proxy's,
+        // which would put the operator surface wherever the agents are.
+        let base = self.admin_listen.unwrap_or_else(|| {
+            default_admin_listen().expect("the default control plane address is always set")
+        });
+        self.admin_listen = Some(parse_bind(spec, base)?);
+        Ok(())
+    }
+}
+
+fn parse_bind(spec: &str, base: SocketAddr) -> Result<SocketAddr> {
+    let spec = spec.trim();
+    if let Ok(addr) = spec.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(port) = spec.parse::<u16>() {
+        let mut addr = base;
+        addr.set_port(port);
+        return Ok(addr);
+    }
+    bail!(
+        "`{spec}` is not an address — expected `HOST:PORT` such as `0.0.0.0:8080`, \
+         or a bare port to keep the interface already configured"
+    )
+}
+
 fn default_listen() -> SocketAddr {
     "127.0.0.1:8080".parse().unwrap()
 }
@@ -436,6 +487,17 @@ impl Config {
             SecretRef::parse(reference).context("server.admin_token")?;
         }
 
+        // Whichever bound second would fail at startup, and which one that is
+        // depends on ordering rather than on anything the operator wrote. Port
+        // 0 is exempt: it asks the OS for any free port, so two of them are two
+        // different sockets, not a collision.
+        if self.server.listen.port() != 0 && self.server.admin_listen == Some(self.server.listen) {
+            bail!(
+                "the proxy and the control plane are both on {} — the control plane needs its own address",
+                self.server.listen
+            );
+        }
+
         let mut seen = std::collections::HashSet::new();
         for agent in &self.agents {
             if !seen.insert(&agent.id) {
@@ -655,6 +717,98 @@ methods = ["POST"]
 paths = ["/v1/messages"]
 action = "allow"
 "#;
+
+    fn server_on(listen: &str, admin: Option<&str>) -> ServerConfig {
+        ServerConfig {
+            listen: listen.parse().unwrap(),
+            admin_listen: admin.map(|a| a.parse().unwrap()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_full_address_override_replaces_the_configured_one() {
+        let mut server = server_on("127.0.0.1:8080", None);
+        server.override_listen("0.0.0.0:9000").unwrap();
+        assert_eq!(server.listen.to_string(), "0.0.0.0:9000");
+
+        // IPv6, because a container often has nothing else.
+        server.override_listen("[::]:9100").unwrap();
+        assert_eq!(server.listen.to_string(), "[::]:9100");
+    }
+
+    #[test]
+    fn a_bare_port_moves_the_port_and_never_the_interface() {
+        // This is the security property of the shorthand: `--listen 9000` on a
+        // loopback config must not become `0.0.0.0:9000` and put a process
+        // holding live credentials on every interface.
+        let mut server = server_on("127.0.0.1:8080", None);
+        server.override_listen("9000").unwrap();
+        assert_eq!(server.listen.to_string(), "127.0.0.1:9000");
+
+        // And the converse: a deployment that already chose every interface
+        // keeps it, so the shorthand is not quietly narrowing either.
+        let mut server = server_on("0.0.0.0:8080", None);
+        server.override_listen("9000").unwrap();
+        assert_eq!(server.listen.to_string(), "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn the_control_plane_can_be_moved_or_switched_off() {
+        let mut server = server_on("127.0.0.1:8080", Some("127.0.0.1:8081"));
+        server.override_admin_listen("9001").unwrap();
+        assert_eq!(
+            server.admin_listen.map(|a| a.to_string()).as_deref(),
+            Some("127.0.0.1:9001")
+        );
+
+        for spelling in ["off", "OFF", "none", "false"] {
+            let mut server = server_on("127.0.0.1:8080", Some("127.0.0.1:8081"));
+            server.override_admin_listen(spelling).unwrap();
+            assert!(server.admin_listen.is_none(), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn a_bare_port_for_a_disabled_control_plane_does_not_inherit_the_proxys_interface() {
+        // The proxy may be on 0.0.0.0; the operator surface must not land there
+        // just because the file had switched it off.
+        let mut server = server_on("0.0.0.0:8080", None);
+        server.override_admin_listen("9001").unwrap();
+        assert_eq!(
+            server.admin_listen.map(|a| a.to_string()).as_deref(),
+            Some("127.0.0.1:9001")
+        );
+    }
+
+    #[test]
+    fn a_meaningless_address_is_rejected_rather_than_guessed() {
+        let mut server = server_on("127.0.0.1:8080", None);
+        for spec in ["", "localhost", "0.0.0.0:", "70000", "-1", "eighty"] {
+            let error = server.override_listen(spec).unwrap_err().to_string();
+            assert!(error.contains("is not an address"), "{spec}: {error}");
+        }
+        // Nothing was half-applied on the way to the error.
+        assert_eq!(server.listen.to_string(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn the_proxy_and_the_control_plane_may_not_share_an_address() {
+        let mut config: Config = toml::from_str(MINIMAL).unwrap();
+        config.server.override_admin_listen("8080").unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("needs its own address"), "{error}");
+    }
+
+    #[test]
+    fn port_zero_is_not_a_collision() {
+        // `:0` asks the OS for any free port, so two of them are two different
+        // sockets. The end-to-end suite binds both that way.
+        let mut config: Config = toml::from_str(MINIMAL).unwrap();
+        config.server.override_listen("127.0.0.1:0").unwrap();
+        config.server.override_admin_listen("127.0.0.1:0").unwrap();
+        config.validate().unwrap();
+    }
 
     #[test]
     fn minimal_config_round_trips_and_defaults_to_deny() {
