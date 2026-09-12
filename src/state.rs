@@ -1,6 +1,6 @@
 //! Everything the request path needs, assembled once at startup.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,17 +24,56 @@ pub struct AppState {
     pub admin_token: String,
 }
 
+/// Resolve every reference the policy file names, before anything binds a port.
+///
+/// Reports all of the failures rather than the first: a proxy fronting twenty
+/// upstreams should not need twenty restarts to discover that three of its
+/// references are wrong.
+fn preload_secrets(config: &Config, resolver: &SecretResolver) -> Result<()> {
+    let references = config.secret_refs();
+    let mut failures = Vec::new();
+    for reference in &references {
+        if let Err(error) = resolver.resolve(reference) {
+            failures.push((reference.clone(), format!("{error:#}")));
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    // Only mention `op` when an `op://` reference is one of the ones that
+    // actually failed. Blaming 1Password for an unset environment variable
+    // sends the operator to sign into a vault this config never mentions —
+    // and `op` is never even invoked unless a reference asks for it.
+    let hint = if failures
+        .iter()
+        .any(|(reference, _)| reference.starts_with("op://"))
+    {
+        " — is `op` signed in?"
+    } else {
+        ""
+    };
+
+    let detail = failures
+        .iter()
+        .map(|(reference, error)| format!("  {reference}: {error}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    bail!(
+        "{} of {} secret references could not be resolved{hint}\n{detail}",
+        failures.len(),
+        references.len(),
+    )
+}
+
 impl AppState {
     pub fn build(config: Config, audit_to_stderr: bool) -> Result<Arc<Self>> {
         let resolver = Arc::new(SecretResolver::new(config.server.op_binary.clone()));
 
         // Resolve everything now: a missing key or a locked 1Password vault should
         // stop startup, not surface as a mystery 502 on the first real request.
-        for reference in config.secret_refs() {
-            resolver
-                .resolve(&reference)
-                .with_context(|| "preloading secrets (is `op` signed in?)")?;
-        }
+        preload_secrets(&config, &resolver)?;
 
         let agents = AgentRegistry::build(&config, &resolver)?;
         let acl = Acl::compile(&config)?;
@@ -111,5 +150,81 @@ impl AppState {
             .write(record)
             .context("writing the first audit record — is the log path writable?")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config whose every secret reference is broken, so startup has to
+    /// report on all of them.
+    fn config_with(refs: &[&str]) -> Config {
+        let upstreams: String = refs
+            .iter()
+            .enumerate()
+            .map(|(index, reference)| {
+                format!(
+                    r#"
+[[upstreams]]
+name = "up{index}"
+base_url = "https://example.invalid"
+auth = {{ type = "bearer", secret = "{reference}" }}
+"#
+                )
+            })
+            .collect();
+        toml::from_str(&format!(
+            r#"
+[[agents]]
+id = "a"
+token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+{upstreams}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn every_broken_reference_is_reported_not_just_the_first() {
+        // Twenty upstreams should not mean twenty restarts to find three typos.
+        let config = config_with(&["env:MCP_IAP_NOT_SET_ONE", "env:MCP_IAP_NOT_SET_TWO"]);
+        let resolver = SecretResolver::new("op");
+        let error = preload_secrets(&config, &resolver).unwrap_err().to_string();
+
+        assert!(error.contains("2 of 2"), "{error}");
+        assert!(error.contains("MCP_IAP_NOT_SET_ONE"), "{error}");
+        assert!(error.contains("MCP_IAP_NOT_SET_TWO"), "{error}");
+    }
+
+    #[test]
+    fn an_unset_environment_variable_is_never_blamed_on_1password() {
+        // The whole defect: `op` is not invoked unless a reference asks for it,
+        // so naming it here sends the operator to sign into a vault this config
+        // does not mention.
+        let config = config_with(&["env:MCP_IAP_NOT_SET_ONE"]);
+        let resolver = SecretResolver::new("op");
+        let error = preload_secrets(&config, &resolver).unwrap_err().to_string();
+
+        assert!(!error.contains("op"), "{error}");
+        assert!(error.contains("is not set"), "{error}");
+    }
+
+    #[test]
+    fn the_1password_hint_appears_when_an_op_reference_is_the_one_failing() {
+        let config = config_with(&["env:MCP_IAP_NOT_SET_ONE", "op://Vault/Item/field"]);
+        // A binary that cannot exist, so the `op` branch fails without needing
+        // the real CLI installed or signed in.
+        let resolver = SecretResolver::new("mcp-iap-no-such-op-binary");
+        let error = preload_secrets(&config, &resolver).unwrap_err().to_string();
+
+        assert!(error.contains("is `op` signed in?"), "{error}");
+        assert!(error.contains("op://Vault/Item/field"), "{error}");
+    }
+
+    #[test]
+    fn a_config_whose_references_all_resolve_preloads_cleanly() {
+        let config = config_with(&["literal:sk-test"]);
+        let resolver = SecretResolver::new("op");
+        preload_secrets(&config, &resolver).unwrap();
     }
 }
