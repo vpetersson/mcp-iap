@@ -8,20 +8,139 @@ An identity-aware proxy for LLM agents.
 Everything else here — the ACL, the interactive prompt, the tamper-evident audit
 log — exists to make that grant narrow, observable and revocable.
 
-```
-  agent ──IAP token──▶  mcp-iap  ──real credential──▶  api.anthropic.com
-                          │                             api.github.com
-                          │                             an MCP server
-                          ├─ who is this?      (agent token → identity)
-                          ├─ may it do this?   (ACL: allow / deny / ask)
-                          ├─ ask a human       (TUI, Little Snitch style)
-                          └─ write it down     (hash-chained JSONL)
+```mermaid
+flowchart LR
+    subgraph agents["agent VLAN — ephemeral, holds no real credential"]
+        A1["Claude Code"]
+        A2["Codex"]
+        A3["CI runner"]
+    end
+
+    subgraph iap["mcp-iap — where the credentials live"]
+        direction TB
+        ID["who is this?<br/>agent token → identity"]
+        ACL{"may it do this?<br/>ACL, default deny"}
+        ASK["ask a human<br/>TUI, Little Snitch style"]
+        INJ["attach the real credential"]
+        LOG[["write it down<br/>hash-chained JSONL"]]
+        ID --> ACL
+        ACL -->|"allow"| INJ
+        ACL -->|"ask"| ASK
+        ASK -->|"allowed"| INJ
+        ACL -->|"deny"| LOG
+        ASK -->|"denied, or nobody answered"| LOG
+        INJ --> LOG
+    end
+
+    SM[("1Password / env / file")]
+
+    subgraph up["upstreams"]
+        U1["api.anthropic.com"]
+        U2["api.github.com"]
+        U3["an MCP server"]
+    end
+
+    A1 -->|"iap_…"| ID
+    A2 -->|"iap_…"| ID
+    A3 -->|"iap_…"| ID
+    SM -.->|"resolved at startup"| INJ
+    INJ -->|"real credential"| U1
+    INJ --> U2
+    INJ --> U3
 ```
 
 The agent holds a token minted by the proxy. It is not an API key, it buys
 nothing anywhere else, and revoking it rotates nothing. The real credential is
 resolved from 1Password (or the environment, or a file) inside the proxy and
 attached on the way out, after the policy has already said yes.
+
+## Why this exists
+
+The setup this was built for: agents run on a VLAN of their own, ephemeral, and
+all they can reach is the internet, a model API and a dedicated GitHub account.
+Nothing in that VLAN holds a credential worth stealing — which is exactly what
+makes it safe to hand an agent a repository and let it work unattended.
+
+That stops working the moment the task is not code. Build a report from Google
+Analytics, check a setting in Cloudflare, pull numbers out of a third-party
+dashboard, and the agent needs a credential for a system that was never part of
+the arrangement. The two usual answers are both bad:
+
+- **Paste the key into the agent.** It is now in an environment, a config file,
+  a context window, and whatever got logged on the way past. It works from
+  anywhere, it does everything that key can do, it lasts until a human remembers
+  to rotate it, and the upstream's own audit log will tell you the key was used
+  — not which agent used it. A prompt injection and a stolen laptop are the same
+  event from the upstream's point of view.
+- **Do it yourself.** The agent stops at the boundary and a human copies numbers
+  between tabs, which is the work you were trying to hand over.
+
+The missing piece is not a better vault. It is the answer to a narrower
+question: *can this agent, right now, make this one call against this service* —
+answered without the agent ever holding the thing that makes the call work.
+
+### What the proxy changes
+
+The agent gets a token minted by the proxy. It is not an API key: it buys
+nothing anywhere else, it names one agent, and deleting one line revokes it
+without rotating anything real. The credential stays on the proxy's side of the
+boundary and is attached on the way out, after policy has already said yes.
+
+```mermaid
+flowchart TB
+    subgraph before["The agent holds the API key"]
+        direction TB
+        K["CLOUDFLARE_API_TOKEN<br/>in the agent's environment"]
+        K --> K1["works from anywhere"]
+        K --> K2["every zone, every verb"]
+        K --> K3["revoking it breaks<br/>everything else using it"]
+        K --> K4["upstream log says<br/>the key was used"]
+    end
+
+    subgraph after["The agent holds an IAP token"]
+        direction TB
+        T["IAP_TOKEN=iap_…<br/>in the agent's environment"]
+        T --> T1["works only against this proxy"]
+        T --> T2["only the paths the ACL allows,<br/>default deny"]
+        T --> T3["revoked by deleting one line<br/>— nothing real rotates"]
+        T --> T4["every call names the agent<br/>and the rule that permitted it"]
+    end
+```
+
+So a leaked agent context leaks a token whose entire power is the ACL, and the
+blast radius of a compromised agent is that rule set rather than the API key's
+own scope. That is the whole argument; § Security model is the same claim with
+its limits attached.
+
+### Where it sits
+
+Little Snitch asks a human before an application is allowed to reach the
+network. A secrets manager — 1Password, Vault, [OpenBao](https://openbao.org) —
+decides who may *read* a credential. This is the join of the two: the secrets
+manager's answer is resolved inside the proxy and never handed to the caller,
+and the per-connection question Little Snitch asks gets asked per credentialed
+call instead, with the answer written down.
+
+It is deliberately none of the following. It is not a secrets manager — it
+reads from yours. It is not a firewall — allowing a call is not opening the
+network, and the agent VLAN still needs its own rules. It is not a sandbox — it
+constrains what an agent can *reach*, never what it can compute.
+
+### How long a grant lasts
+
+Today a grant is bounded by policy, by the approval prompt and by revocation,
+not by a clock. An `ask` rule is answered per call; "remember for this session"
+lasts until the process exits; an agent token is valid until you remove it. The
+credentials that *are* time-bound are the ones the proxy mints upstream
+(`oauth2_client_credentials`, `service_account_jwt`) — those expire on their own
+and the agent never sees them either.
+
+The bound worth having is the one the agent asks for: access to Google
+Analytics for the next hour, and nothing after it. That is a short-lived,
+scope-bound workload token, minted against the agent token and expiring by
+itself — in review in [#20](https://github.com/vpetersson/mcp-iap/pull/20), not
+on `master`. Until it lands, "for the next hour" is a rule you add and remove,
+and the audit log is what tells you it was only used in between.
 
 ## Quickstart
 
@@ -120,6 +239,27 @@ cases where the policy file is generated by something other than this CLI.
 ```
 
 ## What happens to a request
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Agent
+    participant IAP as mcp-iap
+    participant You as You, at the TUI
+    participant API as api.cloudflare.com
+
+    Agent->>IAP: POST /cloudflare/zones/.../purge_cache<br/>Authorization: Bearer iap_...
+    IAP->>IAP: identify — sha256 of the token names the agent
+    IAP->>IAP: route — the path prefix selects the cloudflare upstream
+    IAP->>IAP: decide — first matching ACL rule says ask
+    IAP->>You: park the request: this agent wants this call
+    You-->>IAP: allow, this once
+    IAP->>IAP: strip the agent's token, attach the real credential
+    IAP->>API: POST /zones/.../purge_cache
+    API-->>IAP: 200
+    IAP->>IAP: record — one JSONL line, chained to the one before
+    IAP-->>Agent: 200, streamed back — never the credential
+```
 
 1. **Identify.** The agent sends `Authorization: Bearer <iap-token>` (or
    `X-IAP-Token`). Only the token's sha256 is stored in the policy file.
