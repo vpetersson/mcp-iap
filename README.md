@@ -338,10 +338,40 @@ stops at the proxy, denied calls never reach the network, an `ask` releases only
 when a human answers, and the resulting log verifies.
 
 CI runs exactly the three commands above on Linux and macOS, plus `cargo audit`
-over the dependency tree — a dependency with a known advisory fails the build.
-Dependabot opens weekly grouped PRs for Cargo and for the actions themselves.
-Windows is not covered: the credential file permissions and the MCP stdio bridge
-are Unix-shaped today.
+over the dependency tree — a dependency with a known advisory fails the build —
+and `scripts/check-version.sh`, described below. Dependabot opens weekly grouped
+PRs for Cargo and for the actions themselves. Windows is not covered: the
+credential file permissions and the MCP stdio bridge are Unix-shaped today.
+
+## Versioning
+
+CalVer, `YYYY.MM.PATCH`: `2026.9.0`, then `2026.9.1` for the next release that
+month, then `2026.10.0`. A version tells you when a build was cut, which is the
+question you actually have about something you deployed six weeks ago.
+
+The month is not zero-padded. Cargo requires a semver-shaped version and semver
+forbids leading zeros, so `2026.09.0` is not a version at all and `2026.9.0` is.
+A consequence worth knowing: Cargo reads the year as the major, so every new
+month looks like a breaking change to a `^` constraint. That is the honest
+default here — this is a daemon you deploy, not a library you link, and the
+compatibility surface that matters is the policy file, not a Rust API. Changes
+that make an existing `iap.toml` stop loading are called out in the release
+notes for that version.
+
+Cutting a release:
+
+```bash
+scripts/bump-version.sh                  # today's CalVer → Cargo.toml + Cargo.lock
+git commit -am "chore: release 2026.9.1"
+git tag v2026.9.1 && git push && git push --tags
+```
+
+`scripts/bump-version.sh` works out the next version itself — the patch
+continues within a month and resets when the month rolls over — and refuses to
+leave the tree edited if what it produced is not valid. Pass a version to
+override it. `scripts/check-version.sh` runs in CI on every push and pull
+request, and on a `v…` tag it additionally requires the tag and `Cargo.toml` to
+agree, so a release cannot report a version that is nowhere in the history.
 
 ## License
 

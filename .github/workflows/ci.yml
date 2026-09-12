@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [master]
+    # A release is a tag, and the version guard below is most of what makes one
+    # trustworthy — so tags have to run CI too.
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -18,6 +21,16 @@ permissions:
   contents: read
 
 jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # CalVer is a convention until something rejects a version that is not
+      # one. On a tag this also proves the tag and Cargo.toml agree, so a
+      # release cannot report a version that is nowhere in the history.
+      - run: ./scripts/check-version.sh
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
