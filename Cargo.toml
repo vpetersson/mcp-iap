@@ -1,6 +1,6 @@
 [package]
 name = "mcp-iap"
-version = "0.1.0"
+version = "2026.9.0"
 edition = "2021"
 description = "Identity-Aware Proxy for LLM agents: authenticated, ACL-gated, fully audited access to APIs and MCP servers without ever handing the agent the real credential."
 license = "MIT"
