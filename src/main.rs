@@ -1394,9 +1394,27 @@ fn show_profile(id: &str) -> Result<()> {
     println!("kind        {}", profile.service.kind());
     println!("endpoint    {}", profile.endpoint());
     println!("default as  {}", profile.default_name);
+    // "create one at" is wrong for the profiles that need no credential; the
+    // url is then a pointer to the docs, not to a key-issuing page.
+    let needs_credential = !matches!(
+        profile.service,
+        mcp_iap::profiles::Service::McpHttp {
+            auth: mcp_iap::profiles::AuthTemplate::None,
+            ..
+        } | mcp_iap::profiles::Service::Http {
+            auth: mcp_iap::profiles::AuthTemplate::None,
+            ..
+        }
+    );
     println!(
-        "credential  {}\n            create one at {}",
-        profile.credential.about, profile.credential.url
+        "credential  {}\n            {} {}",
+        profile.credential.about,
+        if needs_credential {
+            "create one at"
+        } else {
+            "docs:"
+        },
+        profile.credential.url
     );
 
     if !profile.vars.is_empty() {

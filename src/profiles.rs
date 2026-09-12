@@ -604,6 +604,43 @@ fn google(id: &str, title: &str, summary: &str, base_url: &str, levels: Vec<Acce
     }
 }
 
+/// The one Cloudflare MCP server that needs no credential at all.
+///
+/// Verified by asking it: `docs.mcp.cloudflare.com` answers `initialize`
+/// unauthenticated, where every other `*.mcp.cloudflare.com` returns 401. So it
+/// does not need the `mcp-remote` OAuth detour, and fronting it directly means
+/// the proxy relays and rules on it rather than shelling out to npx.
+fn cloudflare_docs_mcp() -> Profile {
+    Profile {
+        id: "cloudflare-mcp-docs".into(),
+        title: "Cloudflare Documentation MCP".into(),
+        vendor: "Cloudflare".into(),
+        summary: "Search Cloudflare's documentation. No account access, no credential.".into(),
+        default_name: "cf-docs".into(),
+        credential: Credential {
+            about: "none — this server is public".into(),
+            url: "https://developers.cloudflare.com/agents/model-context-protocol/".into(),
+        },
+        vars: vec![],
+        service: Service::McpHttp {
+            url: "https://docs.mcp.cloudflare.com/mcp".into(),
+            auth: AuthTemplate::None,
+        },
+        access: vec![access(
+            "read",
+            "every tool; the server only reads public documentation",
+            &[],
+            vec![rule("tools", &["tools/call"], &["**"], "allow")],
+        )],
+        note: Some(
+            "The only Cloudflare MCP server that takes no credential, so `--secret` is not \
+             required and the proxy fronts it directly rather than through `mcp-remote`. \
+             It reaches no account data."
+                .into(),
+        ),
+    }
+}
+
 fn cloudflare_mcp(slug: &str, host: &str, title: &str, summary: &str) -> Profile {
     Profile {
         id: format!("cloudflare-mcp-{slug}"),
@@ -670,7 +707,7 @@ fn cloudflare_mcp(slug: &str, host: &str, title: &str, summary: &str) -> Profile
             ),
         ],
         note: Some(
-            "Cloudflare's hosted MCP servers authenticate with an interactive OAuth flow, \
+            "This Cloudflare MCP server authenticates with an interactive OAuth flow, \
              not an API token, so this profile runs them through `mcp-remote` rather than \
              fronting the endpoint directly. That means the OAuth grant lives in the \
              child's cache, outside the proxy — the proxy still sees and rules on every \
@@ -840,7 +877,12 @@ pub fn catalog() -> Vec<Profile> {
                 access(
                     "read",
                     "list metadata and run queries",
-                    &["https://www.googleapis.com/auth/bigquery.readonly"],
+                    // Not `bigquery.readonly`: BigQuery v2 has no such scope,
+                    // and Google rejects it at the token exchange rather than
+                    // on the call, so the whole upstream would be dead. The
+                    // read-only scope its discovery document actually lists —
+                    // and that `jobs.query` accepts — is this one.
+                    &["https://www.googleapis.com/auth/cloud-platform.read-only"],
                     vec![
                         rule("reads", &["GET"], &["/bigquery/v2/**"], "allow"),
                         rule(
@@ -875,7 +917,18 @@ pub fn catalog() -> Vec<Profile> {
                     "write",
                     "also upload, update and delete",
                     &["https://www.googleapis.com/auth/drive"],
-                    vec![rule("all", &["*"], &["/drive/v3/**", "/upload/drive/v3/**"], "allow")],
+                    vec![rule(
+                        "all",
+                        &["*"],
+                        &[
+                            "/drive/v3/**",
+                            "/upload/drive/v3/**",
+                            // Resumable uploads are a third prefix, not a
+                            // suffix of the simple-upload one.
+                            "/resumable/upload/drive/v3/**",
+                        ],
+                        "allow",
+                    )],
                 ),
             ],
         ),
@@ -887,9 +940,24 @@ pub fn catalog() -> Vec<Profile> {
             vec![
                 access(
                     "read",
-                    "get values and metadata",
+                    "get values and metadata; the data-filter reads are POSTs",
                     &["https://www.googleapis.com/auth/spreadsheets.readonly"],
-                    vec![rule("reads", &["GET"], &["/v4/spreadsheets/**"], "allow")],
+                    vec![
+                        rule("reads", &["GET"], &["/v4/spreadsheets/**"], "allow"),
+                        // `getByDataFilter` and `batchGetByDataFilter` are
+                        // reads that take a body, so a GET-only level cannot
+                        // reach them.
+                        rule(
+                            "filtered-reads",
+                            &["POST"],
+                            &[
+                                "/v4/spreadsheets/*:getByDataFilter",
+                                "/v4/spreadsheets/*/values:batchGetByDataFilter",
+                                "/v4/spreadsheets/*/developerMetadata/search",
+                            ],
+                            "allow",
+                        ),
+                    ],
                 ),
                 access(
                     "write",
@@ -1408,12 +1476,6 @@ pub fn catalog() -> Vec<Profile> {
             "The account-wide API surface as MCP tools.",
         ),
         (
-            "docs",
-            "docs.mcp.cloudflare.com",
-            "Cloudflare Documentation MCP",
-            "Search Cloudflare's documentation. No account access.",
-        ),
-        (
             "bindings",
             "bindings.mcp.cloudflare.com",
             "Workers Bindings MCP",
@@ -1500,6 +1562,7 @@ pub fn catalog() -> Vec<Profile> {
     ] {
         profiles.push(cloudflare_mcp(slug, host, title, summary));
     }
+    profiles.push(cloudflare_docs_mcp());
 
     profiles.sort_by(|a, b| a.id.cmp(&b.id));
     profiles
@@ -1551,6 +1614,202 @@ mod tests {
                 seen.insert(profile.id.clone()),
                 "duplicate id {}",
                 profile.id
+            );
+        }
+    }
+
+    /// Every OAuth scope each Google API actually publishes, taken from its
+    /// discovery document (`https://<api>.googleapis.com/$discovery/rest`) on
+    /// 2026-09-12. A scope outside this set is not "too broad" — Google
+    /// rejects it at the token exchange, so the upstream never works at all
+    /// and the failure names the scope rather than the call.
+    ///
+    /// This is here because `bigquery.readonly` reads like it must exist and
+    /// does not; the profile asked for it and every BigQuery call would have
+    /// died at the mint. Re-run the discovery fetch before adding to this list.
+    const PUBLISHED_GOOGLE_SCOPES: &[(&str, &[&str])] = &[
+        (
+            "google-search-console",
+            &["webmasters", "webmasters.readonly"],
+        ),
+        (
+            "google-analytics-data",
+            &["analytics", "analytics.readonly"],
+        ),
+        (
+            "google-analytics-admin",
+            &["analytics.edit", "analytics.readonly"],
+        ),
+        ("google-indexing", &["indexing"]),
+        (
+            "google-bigquery",
+            &[
+                "bigquery",
+                "bigquery.insertdata",
+                "cloud-platform",
+                "cloud-platform.read-only",
+                "devstorage.full_control",
+                "devstorage.read_only",
+                "devstorage.read_write",
+            ],
+        ),
+        (
+            "google-drive",
+            &[
+                "drive",
+                "drive.appdata",
+                "drive.apps.readonly",
+                "drive.file",
+                "drive.meet.readonly",
+                "drive.metadata",
+                "drive.metadata.readonly",
+                "drive.photos.readonly",
+                "drive.readonly",
+                "drive.scripts",
+            ],
+        ),
+        (
+            "google-sheets",
+            &[
+                "drive",
+                "drive.file",
+                "drive.readonly",
+                "spreadsheets",
+                "spreadsheets.readonly",
+            ],
+        ),
+        (
+            "google-cloud-logging",
+            &[
+                "cloud-platform",
+                "cloud-platform.read-only",
+                "logging.admin",
+                "logging.read",
+                "logging.write",
+            ],
+        ),
+        (
+            "google-cloud-storage",
+            &[
+                "cloud-platform",
+                "cloud-platform.read-only",
+                "devstorage.full_control",
+                "devstorage.read_only",
+                "devstorage.read_write",
+            ],
+        ),
+    ];
+
+    #[test]
+    fn every_google_scope_is_one_google_actually_publishes() {
+        for (id, published) in PUBLISHED_GOOGLE_SCOPES {
+            let profile = get(id).unwrap();
+            for level in &profile.access {
+                for scope in &level.scopes {
+                    let short = scope
+                        .strip_prefix("https://www.googleapis.com/auth/")
+                        .unwrap_or_else(|| {
+                            panic!("{id}/{}: `{scope}` is not a Google scope url", level.name)
+                        });
+                    assert!(
+                        published.contains(&short),
+                        "{id}/{}: `{short}` is not in {id}'s discovery document — Google \
+                         rejects an unknown scope at the token exchange, so every call \
+                         through this upstream would fail. Published: {published:?}",
+                        level.name,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bigquery_does_not_ask_for_a_scope_that_does_not_exist() {
+        // Regression: `bigquery.readonly` is not a BigQuery v2 scope. The
+        // read-only scope its own discovery document lists, and that
+        // `jobs.query` accepts, is `cloud-platform.read-only`.
+        let read = get("google-bigquery").unwrap();
+        let read = read.find_access("read").unwrap();
+        assert!(!read.scopes.iter().any(|s| s.ends_with("bigquery.readonly")));
+        assert!(read
+            .scopes
+            .iter()
+            .any(|s| s.ends_with("cloud-platform.read-only")));
+    }
+
+    #[test]
+    fn the_public_cloudflare_docs_server_asks_for_no_credential() {
+        // It answers `initialize` unauthenticated where every other
+        // `*.mcp.cloudflare.com` returns 401, so it needs neither a secret nor
+        // the `mcp-remote` OAuth detour the rest of them do.
+        let profile = get("cloudflare-mcp-docs").unwrap();
+        assert!(matches!(
+            profile.service,
+            Service::McpHttp {
+                auth: AuthTemplate::None,
+                ..
+            }
+        ));
+        let added = |secret: Option<String>| AddOptions {
+            name: None,
+            secret,
+            access: None,
+            vars: vec![],
+            agent: None,
+            dry_run: true,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iap.toml");
+        crate::init::init(&crate::init::InitOptions {
+            path: path.clone(),
+            template: crate::init::Template::Minimal,
+            ..Default::default()
+        })
+        .unwrap();
+        add(&path, &profile, &added(None)).expect("a public server must not demand a secret");
+    }
+
+    #[test]
+    fn a_read_level_reaches_the_reads_that_are_posts() {
+        // Several vendors express reads as POSTs — Search Console's
+        // `searchAnalytics.query`, GA4's `runReport`, Sheets' data-filter
+        // getters, Graylog's searches. A GET-only "read" level is one that
+        // cannot read, and the failure looks like a permissions bug.
+        for (id, method, path) in [
+            (
+                "google-search-console",
+                "POST",
+                "/webmasters/v3/sites/example.com/searchAnalytics/query",
+            ),
+            (
+                "google-analytics-data",
+                "POST",
+                "/v1beta/properties/1:runReport",
+            ),
+            (
+                "google-sheets",
+                "POST",
+                "/v4/spreadsheets/abc/values:batchGetByDataFilter",
+            ),
+            ("google-cloud-logging", "POST", "/v2/entries:list"),
+            ("google-bigquery", "POST", "/bigquery/v2/projects/p/queries"),
+            ("graylog", "POST", "/views/search"),
+        ] {
+            let profile = get(id).unwrap();
+            let level = profile.default_access();
+            let reachable = level.rules.iter().any(|rule| {
+                rule.action == "allow"
+                    && rule.methods.iter().any(|m| m == method || m == "*")
+                    && rule.paths.iter().any(|pattern| {
+                        globset::Glob::new(pattern)
+                            .map(|g| g.compile_matcher().is_match(path))
+                            .unwrap_or(false)
+                    })
+            });
+            assert!(
+                reachable,
+                "{id}: `{method} {path}` is a documented read that the `{}` level cannot reach",
+                level.name
             );
         }
     }

@@ -163,7 +163,16 @@ Access levels are per profile and `profile show` lists them. They differ in
 scopes as well as paths, which is the part that is easy to get wrong by hand:
 Search Console's `read` asks Google for `webmasters.readonly` and its `write`
 asks for `webmasters`, and no amount of ACL gets a `readonly` token to submit a
-sitemap.
+sitemap. Worse, a scope that does not exist is not a narrower grant — Google
+rejects it at the token exchange, so the upstream never works at all. BigQuery
+has no `bigquery.readonly` however much it reads like it should; every Google
+scope in the catalog is checked against that API's discovery document by a test.
+
+Two more things the profiles know that are easy to miss by hand: a "read" level
+cannot be GET-only, because several vendors express reads as POSTs — Search
+Console's `searchAnalytics.query`, GA4's `runReport`, Sheets' data-filter
+getters, Graylog's searches, Cloud Logging's `entries:list`. And an MCP profile
+has to admit `initialize` or the session never opens.
 
 Two levels are worth knowing about because they exist for reasons that are not
 about permissions:
@@ -194,12 +203,13 @@ it.
 
 Two honest limits, both printed by `profile show`:
 
-- **Cloudflare's hosted MCP servers speak OAuth, not API tokens.** The
-  `cloudflare-mcp-*` profiles therefore run them through `npx mcp-remote`, which
+- **Fifteen of Cloudflare's sixteen hosted MCP servers speak OAuth, not API
+  tokens.** Those profiles therefore run them through `npx mcp-remote`, which
   does the browser flow and caches the grant. The proxy still rules on and logs
   every JSON-RPC message, but the credential lives in the child's cache rather
   than in the proxy. For a credential the proxy actually holds, the `cloudflare`
-  REST profile covers the same services.
+  REST profile covers the same services. The exception is
+  `cloudflare-mcp-docs`, which answers unauthenticated and is fronted directly.
 - **Tool catalogs move.** PostHog exposes well over a thousand tools, so its
   `read` level allows the read verbs and sends everything else to `ask` rather
   than denying it. Watch the audit log for `ask` rows and promote the ones you
@@ -622,7 +632,7 @@ metadata server and workload identity federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 165 tests: unit + end-to-end through a real proxy
+cargo test        # 169 tests: unit + end-to-end through a real proxy
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -637,6 +647,14 @@ with `profile add` rather than a fixture — so a profile whose base URL, scheme
 or rules are wrong fails in CI rather than against the vendor. Every profile at
 every access level is materialised and run through the daemon's own
 `validate()`, and every MCP profile is asserted to admit `initialize`.
+
+The catalog's own facts are pinned too, because the failure mode for a wrong
+one is a 403 an hour later rather than a test going red. Every Google scope is
+checked against the set that API's discovery document publishes, and the reads
+that are POSTs are asserted reachable from the level named for reading. Both
+lists were taken from the vendors — Google's discovery documents, and a probe of
+every base URL and MCP endpoint in the catalog — rather than from memory. When a
+vendor moves, re-fetch rather than edit the expectation.
 
 CI runs exactly the three commands above on Linux and macOS, plus `cargo audit`
 over the dependency tree — a dependency with a known advisory fails the build —
