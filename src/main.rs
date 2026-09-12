@@ -61,6 +61,14 @@ enum Command {
     Run {
         #[command(flatten)]
         config: ConfigArg,
+        /// Where agents connect: `HOST:PORT`, or a bare port to keep the
+        /// interface the config file chose. Overrides `server.listen`.
+        #[arg(long, value_name = "ADDR", env = "IAP_LISTEN")]
+        listen: Option<String>,
+        /// Where the control plane listens, or `off` to disable it. Overrides
+        /// `server.admin_listen`.
+        #[arg(long, value_name = "ADDR", env = "IAP_ADMIN_LISTEN")]
+        admin_listen: Option<String>,
         /// Open the interactive approval console.
         #[arg(long)]
         tui: bool,
@@ -147,9 +155,41 @@ fn main() -> Result<()> {
             template: template.into(),
             force,
         }),
-        Command::Run { config, tui } => {
-            let config = Config::load(&config.config)?;
+        Command::Run {
+            config,
+            listen,
+            admin_listen,
+            tui,
+        } => {
+            let mut config = Config::load(&config.config)?;
+
+            let overridden = listen.is_some() || admin_listen.is_some();
+            if let Some(spec) = &listen {
+                config.server.override_listen(spec).context("--listen")?;
+            }
+            if let Some(spec) = &admin_listen {
+                config
+                    .server
+                    .override_admin_listen(spec)
+                    .context("--admin-listen")?;
+            }
+            if overridden {
+                // The file was validated on load; the addresses it was
+                // validated with are no longer the ones being bound.
+                config
+                    .validate()
+                    .context("after applying the listen overrides")?;
+            }
+
             init_tracing(tui, &config)?;
+            if overridden {
+                // Otherwise the file and the socket disagree and nothing says why.
+                tracing::info!(
+                    listen = %config.server.listen,
+                    admin_listen = ?config.server.admin_listen,
+                    "listen addresses overridden outside the config file"
+                );
+            }
             tokio_runtime()?.block_on(run(config, tui))
         }
         Command::Mcp {
