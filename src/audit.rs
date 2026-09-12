@@ -85,6 +85,15 @@ impl AuditEvent {
         hex::encode(digest)
     }
 
+    /// Whether this entry is in scope for a filtered view of the log.
+    ///
+    /// One proxy fronts many agents, so a log is interleaved by construction and
+    /// reading it usually means narrowing it to one of them.
+    pub fn matches(&self, agent: Option<&str>, target: Option<&str>) -> bool {
+        agent.is_none_or(|id| self.record.agent == id)
+            && target.is_none_or(|name| self.record.target == name)
+    }
+
     /// A single line for the TUI feed and for `--stderr` output.
     pub fn oneline(&self) -> String {
         let decision = self
@@ -361,6 +370,40 @@ mod tests {
             ..Default::default()
         };
         (AuditLog::open(&config, false).unwrap(), path)
+    }
+
+    fn entry_for(agent: &str, target: &str) -> AuditEvent {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, path) = log_in(dir.path());
+        let mut record = AuditRecord::new("http", "request");
+        record.agent = agent.to_string();
+        record.target = target.to_string();
+        log.write(record).unwrap();
+        drop(log);
+        let line = std::fs::read_to_string(&path).unwrap();
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    #[test]
+    fn a_filtered_view_narrows_one_shared_log_to_one_agent() {
+        let entry = entry_for("bravo", "github");
+
+        assert!(entry.matches(None, None));
+        assert!(entry.matches(Some("bravo"), None));
+        assert!(entry.matches(None, Some("github")));
+        assert!(entry.matches(Some("bravo"), Some("github")));
+
+        // Both filters are conjunctive: the right agent against the wrong
+        // target is not a hit, which is what makes the view trustworthy when
+        // several agents share one upstream.
+        assert!(!entry.matches(Some("alpha"), None));
+        assert!(!entry.matches(None, Some("anthropic")));
+        assert!(!entry.matches(Some("bravo"), Some("anthropic")));
+        assert!(!entry.matches(Some("alpha"), Some("github")));
+
+        // Exact, not prefix: `ci-1` must never answer for `ci-10`.
+        assert!(!entry_for("ci-1", "github").matches(Some("ci-10"), None));
+        assert!(!entry_for("ci-10", "github").matches(Some("ci-1"), None));
     }
 
     #[test]

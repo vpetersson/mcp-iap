@@ -205,6 +205,68 @@ startup, so a locked vault fails the process rather than the tenth request.
 A bare value that is not one of these forms is rejected, and the error never
 echoes what you pasted.
 
+## Multiple agents
+
+One proxy fronts many agents. That is the shape this is built for — the agents
+are the tenants, the upstream credential is the shared thing they are kept away
+from, and the policy file is where the difference between them is written.
+
+```toml
+[[agents]]
+id = "claude-code"
+token_sha256 = "…"
+
+[[agents]]
+id = "ci-runner"
+token_sha256 = "…"
+targets = ["github"]                # hard scope, checked before the ACL
+
+# No `agent` key: this rule is every agent, including ones added later.
+[[acl]]
+target = "anthropic"
+methods = ["POST"]
+paths = ["/v1/messages"]
+action = "allow"
+
+# `agent` is a glob, so one rule can cover a fleet.
+[[acl]]
+agent = "ci-*"
+target = "github"
+methods = ["GET"]
+paths = ["/repos/**"]
+action = "allow"
+```
+
+Each agent has its own token; the file holds only hashes, and two agents sharing
+a token is a startup error rather than a puzzle later. Every audit record names
+the agent that caused it, so one interleaved log still answers per-agent
+questions:
+
+```bash
+mcp-iap audit tail audit/iap-audit.jsonl --agent ci-runner
+mcp-iap audit tail audit/iap-audit.jsonl --agent ci-runner --target github
+```
+
+Approvals are per agent too: a "remember for this session" answer is keyed by
+the agent *and* the exact request, so releasing a call for one agent never
+releases the same call for another.
+
+What this does **not** do yet, and all three matter more as the agent count
+grows:
+
+- **No TLS on the listener.** The proxy speaks plain HTTP and binds loopback by
+  default. Agents on the same host are fine; agents on other hosts would put
+  their tokens on the wire in cleartext, so that deployment needs a TLS
+  terminator in front until the listener grows its own.
+- **Changing the roster means a restart.** There is no reload: adding an agent,
+  or revoking a leaked token, restarts the process and takes every other agent's
+  in-flight request and MCP session with it. At one agent that is free. At
+  twenty it is an outage.
+- **No per-agent limits.** No rate limit, no concurrency cap, no spend budget.
+  The agents share one upstream credential and therefore one quota and one bill,
+  and one runaway agent is felt by all of them — the audit log will tell you
+  which one, afterwards.
+
 ## MCP
 
 MCP over HTTP is just HTTP — front it as an upstream. For stdio servers, the
@@ -316,18 +378,20 @@ What it does not give you, and you should know before relying on it:
 
 ## Not built yet
 
-Rate limits and spend caps per agent; hot config reload; a decoupled TUI that
-attaches to an already-running daemon over the control plane; SSE streaming for
-the HTTP MCP transport (single JSON responses work, `data:` frames are parsed,
-long-lived streams are not); mTLS agent identity; native 1Password Connect
-(the CLI is shelled out to today). On service accounts specifically: only RSA
-keys are supported (Google issues RS256 keys, so this covers Google), and the
-GCP metadata server and workload identity federation are not wired up.
+Rate limits and spend caps per agent; hot config reload; TLS on the listener —
+those three are what a fleet sharing one proxy wants first, and § Multiple
+agents says what each one costs until then. Also: a decoupled TUI that attaches
+to an already-running daemon over the control plane; SSE streaming for the HTTP
+MCP transport (single JSON responses work, `data:` frames are parsed, long-lived
+streams are not); mTLS agent identity; native 1Password Connect (the CLI is
+shelled out to today). On service accounts specifically: only RSA keys are
+supported (Google issues RS256 keys, so this covers Google), and the GCP
+metadata server and workload identity federation are not wired up.
 
 ## Development
 
 ```bash
-cargo test        # 97 tests: unit + end-to-end through a real proxy
+cargo test        # 98 tests: unit + end-to-end through a real proxy
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
