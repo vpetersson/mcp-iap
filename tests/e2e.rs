@@ -617,3 +617,111 @@ async fn every_decision_lands_in_a_verifiable_audit_log() {
     );
     audit::verify_file(&harness.audit_path).unwrap();
 }
+
+/// The control plane authenticates *before* it parses anything.
+///
+/// Handler-body checks run after axum's extractors, so an anonymous `POST
+/// /decide` with a malformed body used to be answered by the JSON extractor —
+/// 422, naming the fields it wanted. On a control plane reachable from an agent
+/// VLAN that is a free schema description for someone who has proven nothing.
+#[tokio::test]
+async fn the_control_plane_authenticates_before_it_parses_a_body() {
+    let harness = spawn_proxy("").await;
+
+    let malformed = client()
+        .post(format!("http://{}/decide", harness.admin))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        malformed.status(),
+        401,
+        "an unauthenticated caller must not reach the body parser"
+    );
+    let body = malformed.text().await.unwrap();
+    assert!(
+        !body.contains("verdict"),
+        "the 401 leaked the request schema: {body}"
+    );
+
+    // No body at all, and no content-type: still the same answer.
+    let bare = client()
+        .post(format!("http://{}/decide", harness.admin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), 401);
+
+    for route in ["status", "pending", "events"] {
+        let anonymous = client()
+            .get(format!("http://{}/{route}", harness.admin))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            anonymous.status(),
+            401,
+            "/{route} answered an anonymous GET"
+        );
+    }
+}
+
+/// The gate has to still let the operator through, by either header spelling.
+#[tokio::test]
+async fn the_admin_token_still_opens_the_control_plane() {
+    let harness = spawn_proxy("").await;
+
+    let bearer = client()
+        .get(format!("http://{}/status", harness.admin))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bearer.status(), 200);
+
+    let header = client()
+        .get(format!("http://{}/pending", harness.admin))
+        .header("x-iap-token", &harness.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(header.status(), 200);
+
+    // `/health` is unauthenticated on purpose — the MCP bridge proves the
+    // policy authority exists before it accepts a message.
+    let health = client()
+        .get(format!("http://{}/health", harness.admin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200);
+}
+
+/// Widening the proxy to a VLAN must not widen the operator surface with it.
+#[tokio::test]
+async fn overriding_the_proxy_listen_leaves_the_control_plane_where_it_was() {
+    let mut config: mcp_iap::config::Config = toml::from_str(
+        r#"
+[server]
+listen = "127.0.0.1:8080"
+admin_listen = "127.0.0.1:8081"
+
+[audit]
+path = "audit/iap-audit.jsonl"
+
+[acl_default]
+action = "deny"
+"#,
+    )
+    .unwrap();
+
+    config.server.override_listen("0.0.0.0:18080").unwrap();
+
+    assert_eq!(config.server.listen.to_string(), "0.0.0.0:18080");
+    assert_eq!(
+        config.server.admin_listen.map(|a| a.to_string()).as_deref(),
+        Some("127.0.0.1:8081"),
+        "`--listen` must never move the control plane onto another interface"
+    );
+}

@@ -456,7 +456,7 @@ metadata server and workload identity federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 124 tests: unit + end-to-end through a real proxy
+cargo test        # 127 tests: unit + end-to-end through a real proxy
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
