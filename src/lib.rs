@@ -16,6 +16,7 @@ pub mod identity;
 pub mod init;
 pub mod list;
 pub mod mcp;
+pub mod profiles;
 pub mod proxy;
 pub mod secrets;
 pub mod service_account;

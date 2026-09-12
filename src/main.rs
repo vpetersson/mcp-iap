@@ -12,6 +12,7 @@ use mcp_iap::identity;
 use mcp_iap::init::{self, InitOptions, Template};
 use mcp_iap::list::{Inventory, ListOptions, What};
 use mcp_iap::mcp;
+use mcp_iap::profiles;
 use mcp_iap::state::AppState;
 
 #[derive(Parser)]
@@ -116,6 +117,12 @@ enum Command {
     /// Add or inspect the services the proxy fronts.
     #[command(subcommand)]
     Upstream(UpstreamCommand),
+    /// Add an MCP server to the policy file.
+    #[command(subcommand, name = "mcp-server")]
+    McpServer(McpServerCommand),
+    /// Ready-made service definitions: base URL, credential scheme and rules.
+    #[command(subcommand)]
+    Profile(ProfileCommand),
     /// Add a rule to the ACL.
     #[command(subcommand)]
     Acl(AclCommand),
@@ -203,29 +210,238 @@ enum UpstreamCommand {
         /// Where the proxy forwards to, e.g. `https://api.anthropic.com`.
         #[arg(long, value_name = "URL")]
         base_url: String,
-        /// Credential scheme to inject on the way out.
-        #[arg(long, value_enum, default_value_t = AuthArg::None)]
-        auth: AuthArg,
-        /// Credential *reference*: `env:NAME`, `file:/path`, `op://vault/item/field`.
-        #[arg(long, value_name = "REF")]
-        secret: Option<String>,
-        /// Header name for `--auth header`, e.g. `x-api-key`.
-        #[arg(long, value_name = "NAME")]
-        header: Option<String>,
-        /// Value prefix for `--auth header`, when the API wants one.
-        #[arg(long, value_name = "PREFIX")]
-        prefix: Option<String>,
-        /// Username for `--auth basic`.
-        #[arg(long)]
-        username: Option<String>,
-        /// Query parameter for `--auth query`, e.g. `key`.
-        #[arg(long, value_name = "NAME")]
-        param: Option<String>,
+        #[command(flatten)]
+        auth: AuthFlags,
         /// Static header to send upstream, `Name=Value`. Repeatable. Never a
         /// credential — that is what `--secret` is for.
         #[arg(long = "set-header", value_name = "NAME=VALUE")]
         set_headers: Vec<String>,
     },
+}
+
+/// Add an MCP server to the policy file. `mcp` itself is the bridge an agent
+/// runs, so enrolment lives under its own noun rather than shadowing it.
+#[derive(Subcommand)]
+enum McpServerCommand {
+    /// Add a `[[mcp_servers]]` entry: a stdio server to spawn, or a remote one.
+    Add {
+        /// Policy name agents address, and the name every audit record uses.
+        name: String,
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Remote endpoint for an HTTP MCP server. Omit for a stdio child.
+        #[arg(long, value_name = "URL", conflicts_with = "command")]
+        url: Option<String>,
+        /// Executable to spawn for a stdio MCP server.
+        #[arg(long, value_name = "BIN")]
+        command: Option<String>,
+        /// Argument for `--command`. Repeatable, in order.
+        #[arg(long = "arg", value_name = "ARG", requires = "command")]
+        args: Vec<String>,
+        /// Child environment entry, `NAME=<secret-ref>`. Repeatable. This is
+        /// how a stdio server gets its credential — the value is a reference,
+        /// resolved in the proxy, never the credential itself.
+        #[arg(long = "env", value_name = "NAME=REF", requires = "command")]
+        env: Vec<String>,
+        /// Working directory for the child.
+        #[arg(long, value_name = "DIR", requires = "command")]
+        cwd: Option<String>,
+        #[command(flatten)]
+        auth: AuthFlags,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    /// List every profile there is.
+    List {
+        /// Only profiles from this vendor, matched case-insensitively.
+        #[arg(long)]
+        vendor: Option<String>,
+        #[arg(long, value_enum, default_value_t = OutputArg::Table)]
+        output: OutputArg,
+    },
+    /// Show what a profile would add: endpoint, credential, scopes, rules.
+    Show {
+        /// Profile id, from `mcp-iap profile list`.
+        id: String,
+    },
+    /// Add a profile's service and rules to the policy file.
+    Add {
+        /// Profile id, from `mcp-iap profile list`.
+        id: String,
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Name to use in the policy file. Defaults to the profile's own, and
+        /// is how one proxy fronts two accounts of the same service.
+        #[arg(long = "as", value_name = "NAME")]
+        name: Option<String>,
+        /// Credential *reference*: `env:NAME`, `file:/path`, `op://vault/item/field`.
+        #[arg(long, value_name = "REF")]
+        secret: Option<String>,
+        /// Which bundle of scopes and rules to write. Defaults to the
+        /// narrowest the profile offers.
+        #[arg(long, value_name = "LEVEL")]
+        access: Option<String>,
+        /// Profile variable, `name=value`. Repeatable.
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        vars: Vec<String>,
+        /// Scope the rules to one agent or glob. Defaults to every agent.
+        #[arg(long, value_name = "ID")]
+        agent: Option<String>,
+        /// Print the TOML that would be appended, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// Everything the credential schemes need. Shared by `upstream add` and
+/// `mcp-server add`, which inject credentials the same way.
+#[derive(Args, Clone)]
+struct AuthFlags {
+    /// Credential scheme to inject on the way out.
+    #[arg(long, value_enum, default_value_t = AuthArg::None)]
+    auth: AuthArg,
+    /// Credential *reference*: `env:NAME`, `file:/path`, `op://vault/item/field`.
+    #[arg(long, value_name = "REF")]
+    secret: Option<String>,
+    /// Header name for `--auth header`, e.g. `x-api-key`.
+    #[arg(long, value_name = "NAME")]
+    header: Option<String>,
+    /// Value prefix for `--auth header`, when the API wants one.
+    #[arg(long, value_name = "PREFIX")]
+    prefix: Option<String>,
+    /// Username for `--auth basic`.
+    #[arg(long)]
+    username: Option<String>,
+    /// Reference for a `--auth basic` user field that *is* the credential —
+    /// Graylog authenticates an access token as `<token>:token`.
+    #[arg(long, value_name = "REF", conflicts_with = "username")]
+    username_secret: Option<String>,
+    /// Query parameter for `--auth query`, e.g. `key`.
+    #[arg(long, value_name = "NAME")]
+    param: Option<String>,
+    /// `--auth service-account-jwt`: reference to the service-account JSON
+    /// key exactly as Google issues it. Supplies issuer, key id and token URL.
+    #[arg(long, value_name = "REF")]
+    key_file: Option<String>,
+    /// Or spell the pieces out: reference to a PKCS#8 PEM private key.
+    #[arg(long, value_name = "REF", conflicts_with = "key_file")]
+    private_key: Option<String>,
+    /// Assertion issuer, for `--private-key`.
+    #[arg(long, value_name = "ISS")]
+    issuer: Option<String>,
+    /// Key id to put in the JWT header, for `--private-key`.
+    #[arg(long, value_name = "KID")]
+    key_id: Option<String>,
+    /// Token endpoint to exchange the assertion at.
+    #[arg(long, value_name = "URL")]
+    token_url: Option<String>,
+    /// The `aud` claim. Defaults to the token URL, which is what Google wants.
+    #[arg(long, value_name = "AUD")]
+    audience: Option<String>,
+    /// Requested scope. Repeatable.
+    #[arg(long = "scope", value_name = "SCOPE")]
+    scopes: Vec<String>,
+    /// Impersonate this user (Google domain-wide delegation).
+    #[arg(long, value_name = "EMAIL")]
+    subject: Option<String>,
+    /// Assertion lifetime in seconds. Clamped to an hour, Google's ceiling.
+    #[arg(long, value_name = "SECS")]
+    lifetime_secs: Option<u64>,
+    /// Client id for `--auth oauth2-client-credentials`.
+    #[arg(long, value_name = "ID")]
+    client_id: Option<String>,
+    /// Client secret *reference* for `--auth oauth2-client-credentials`.
+    #[arg(long, value_name = "REF")]
+    client_secret: Option<String>,
+}
+
+impl AuthFlags {
+    /// Each scheme needs a different subset of the flags, and silently ignoring
+    /// one that was passed is how a credential ends up not being sent.
+    fn to_spec(&self) -> Result<enroll::AuthSpec> {
+        let need_secret = || -> Result<String> {
+            self.secret.clone().context(
+                "this `--auth` scheme needs `--secret <REF>` — the credential reference to inject",
+            )
+        };
+        let spec = match self.auth {
+            AuthArg::None => enroll::AuthSpec::None,
+            AuthArg::Bearer => enroll::AuthSpec::Bearer {
+                secret: need_secret()?,
+            },
+            AuthArg::Header => enroll::AuthSpec::Header {
+                header: self.header.clone().context(
+                    "`--auth header` needs `--header <NAME>`, e.g. `--header x-api-key`",
+                )?,
+                secret: need_secret()?,
+                prefix: self.prefix.clone(),
+            },
+            AuthArg::Basic => {
+                if self.username.is_none() && self.username_secret.is_none() {
+                    bail!(
+                        "`--auth basic` needs `--username <NAME>`, or `--username-secret <REF>` \
+                         for an API like Graylog whose user field is the credential"
+                    );
+                }
+                enroll::AuthSpec::Basic {
+                    username: self.username.clone(),
+                    username_secret: self.username_secret.clone(),
+                    secret: need_secret()?,
+                }
+            }
+            AuthArg::Query => enroll::AuthSpec::Query {
+                param: self
+                    .param
+                    .clone()
+                    .context("`--auth query` needs `--param <NAME>`, e.g. `--param key`")?,
+                secret: need_secret()?,
+            },
+            AuthArg::Oauth2ClientCredentials => enroll::AuthSpec::Oauth2ClientCredentials {
+                token_url: self
+                    .token_url
+                    .clone()
+                    .context("`--auth oauth2-client-credentials` needs `--token-url <URL>`")?,
+                client_id: self
+                    .client_id
+                    .clone()
+                    .context("`--auth oauth2-client-credentials` needs `--client-id <ID>`")?,
+                client_secret: self
+                    .client_secret
+                    .clone()
+                    .context("`--auth oauth2-client-credentials` needs `--client-secret <REF>`")?,
+                // One space-delimited `scope` parameter, which is how the grant
+                // spells a list; `--scope` is repeatable so the caller does not
+                // have to know that.
+                scope: (!self.scopes.is_empty()).then(|| self.scopes.join(" ")),
+                audience: self.audience.clone(),
+            },
+            AuthArg::ServiceAccountJwt => {
+                if self.key_file.is_none() && self.private_key.is_none() {
+                    bail!(
+                        "`--auth service-account-jwt` needs `--key-file <REF>` (the JSON key \
+                         Google issues) or `--private-key <REF>` with `--issuer` and `--token-url`"
+                    );
+                }
+                enroll::AuthSpec::ServiceAccountJwt {
+                    key_file: self.key_file.clone(),
+                    issuer: self.issuer.clone(),
+                    private_key: self.private_key.clone(),
+                    key_id: self.key_id.clone(),
+                    token_url: self.token_url.clone(),
+                    audience: self.audience.clone(),
+                    scopes: self.scopes.clone(),
+                    subject: self.subject.clone(),
+                    lifetime_secs: self.lifetime_secs,
+                }
+            }
+        };
+        if matches!(spec, enroll::AuthSpec::None) && self.secret.is_some() {
+            bail!("`--secret` was given but `--auth` is `none`, so nothing would be injected");
+        }
+        Ok(spec)
+    }
 }
 
 #[derive(Subcommand)]
@@ -266,6 +482,8 @@ enum AuthArg {
     Header,
     Basic,
     Query,
+    Oauth2ClientCredentials,
+    ServiceAccountJwt,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -410,23 +628,57 @@ fn main() -> Result<()> {
             config,
             base_url,
             auth,
-            secret,
-            header,
-            prefix,
-            username,
-            param,
             set_headers,
         }) => add_upstream(AddUpstream {
             path: config.config,
             name,
             base_url,
             auth,
-            secret,
-            header,
-            prefix,
-            username,
-            param,
             set_headers,
+        }),
+        Command::Profile(ProfileCommand::List { vendor, output }) => {
+            list_profiles(vendor.as_deref(), output)
+        }
+        Command::Profile(ProfileCommand::Show { id }) => show_profile(&id),
+        Command::Profile(ProfileCommand::Add {
+            id,
+            config,
+            name,
+            secret,
+            access,
+            vars,
+            agent,
+            dry_run,
+        }) => add_profile(
+            &config.config,
+            &id,
+            profiles::AddOptions {
+                name,
+                secret,
+                access,
+                vars,
+                agent,
+                dry_run,
+            },
+        ),
+        Command::McpServer(McpServerCommand::Add {
+            name,
+            config,
+            url,
+            command,
+            args,
+            env,
+            cwd,
+            auth,
+        }) => add_mcp_server(AddMcpServer {
+            path: config.config,
+            name,
+            url,
+            command,
+            args,
+            env,
+            cwd,
+            auth,
         }),
         Command::Acl(AclCommand::Add {
             config,
@@ -691,6 +943,21 @@ fn check(path: &Path) -> Result<()> {
         config.acl_default.action
     );
 
+    // Before the secrets, because a shape problem in the policy is worth
+    // reporting even on a run that bails on an unresolvable credential.
+    for warning in mcp_handshake_warnings(&config) {
+        println!();
+        for (index, line) in warning.lines().enumerate() {
+            // First line under the `warning` label, the rest aligned to it, so
+            // the copy-pasteable command comes out as one intact block.
+            if index == 0 {
+                println!("warning     {line}");
+            } else {
+                println!("            {line}");
+            }
+        }
+    }
+
     let resolver = mcp_iap::secrets::SecretResolver::new(config.server.op_binary.clone());
     let references = config.secret_refs();
     if references.is_empty() {
@@ -714,6 +981,73 @@ fn check(path: &Path) -> Result<()> {
     }
     println!("\nconfig is valid.");
     Ok(())
+}
+
+/// MCP servers whose rules would deny the handshake.
+///
+/// `initialize` names no tool, so it matches only a rule that leaves `paths`
+/// unconstrained. A policy whose every MCP rule scopes tool names therefore
+/// looks complete, validates, starts — and then the agent's session never
+/// opens, with a `<default>` deny that names no rule to go and fix. This is the
+/// one misconfiguration in the file that produces no useful error at the point
+/// it bites, so `check` says it here instead.
+fn mcp_handshake_warnings(config: &Config) -> Vec<String> {
+    let unconstrained = |paths: &[String]| {
+        paths
+            .iter()
+            .any(|path| matches!(path.as_str(), "*" | "**" | "/**"))
+    };
+
+    let mut warnings = Vec::new();
+    for server in &config.mcp_servers {
+        // Only rules that could reach this server at all, and only ones that
+        // would let `initialize` through: an unconstrained-path allow.
+        let admits_handshake = config.acl.iter().any(|rule| {
+            matches!(rule.kind.as_str(), "mcp" | "*")
+                && glob_matches(&rule.target, &server.name)
+                && rule.action == mcp_iap::config::Action::Allow
+                && unconstrained(&rule.paths)
+                && rule
+                    .methods
+                    .iter()
+                    .any(|method| glob_matches(method, "initialize"))
+        });
+        if admits_handshake {
+            continue;
+        }
+        let reachable = config.acl.iter().any(|rule| {
+            matches!(rule.kind.as_str(), "mcp" | "*") && glob_matches(&rule.target, &server.name)
+        });
+        // A server with no rules at all is already obvious from `list`; the
+        // trap is the one that looks configured.
+        if !reachable {
+            continue;
+        }
+        if config.acl_default.action == mcp_iap::config::Action::Allow {
+            continue;
+        }
+        let fix = profiles::MCP_SESSION_METHODS
+            .iter()
+            .map(|method| format!("--methods '{method}'"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        warnings.push(format!(
+            "mcp server `{name}` has rules, but none of them admits `initialize`.\n\
+             The handshake will be denied by `<default>`, and the agent will see a\n\
+             server that never starts. Add a session rule before the tool rules:\n\n\
+             \x20 mcp-iap acl add --kind mcp --target {name} --paths '**' \\\n\
+             \x20   {fix}",
+            name = server.name,
+        ));
+    }
+    warnings
+}
+
+/// The same `*`/`**` glob the ACL compiles, for names that contain no `/`.
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    globset::Glob::new(pattern)
+        .map(|glob| glob.compile_matcher().is_match(value))
+        .unwrap_or(false)
 }
 
 /// Write a policy file and tell the operator what is left to do.
@@ -790,17 +1124,12 @@ fn add_agent(path: &Path, id: &str, name: Option<&str>, targets: &[String]) -> R
     Ok(())
 }
 
-/// Grouped because clap hands back ten flags and `too_many_arguments` is right.
+/// Grouped because clap hands back a base URL, a name and a whole auth scheme.
 struct AddUpstream {
     path: PathBuf,
     name: String,
     base_url: String,
-    auth: AuthArg,
-    secret: Option<String>,
-    header: Option<String>,
-    prefix: Option<String>,
-    username: Option<String>,
-    param: Option<String>,
+    auth: AuthFlags,
     set_headers: Vec<String>,
 }
 
@@ -810,58 +1139,11 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
         name,
         base_url,
         auth,
-        secret,
-        header,
-        prefix,
-        username,
-        param,
         set_headers,
     } = options;
 
-    // Each scheme needs a different subset of the flags, and silently ignoring
-    // one the operator did pass is how a credential ends up not being sent.
-    let need_secret = || -> Result<String> {
-        secret.clone().context(
-            "this `--auth` scheme needs `--secret <REF>` — the credential reference to inject",
-        )
-    };
-    let auth = match auth {
-        AuthArg::None => enroll::AuthSpec::None,
-        AuthArg::Bearer => enroll::AuthSpec::Bearer {
-            secret: need_secret()?,
-        },
-        AuthArg::Header => enroll::AuthSpec::Header {
-            header: header
-                .clone()
-                .context("`--auth header` needs `--header <NAME>`, e.g. `--header x-api-key`")?,
-            secret: need_secret()?,
-            prefix: prefix.clone(),
-        },
-        AuthArg::Basic => enroll::AuthSpec::Basic {
-            username: username
-                .clone()
-                .context("`--auth basic` needs `--username <NAME>`")?,
-            secret: need_secret()?,
-        },
-        AuthArg::Query => enroll::AuthSpec::Query {
-            param: param
-                .clone()
-                .context("`--auth query` needs `--param <NAME>`, e.g. `--param key`")?,
-            secret: need_secret()?,
-        },
-    };
-    if matches!(auth, enroll::AuthSpec::None) && secret.is_some() {
-        bail!("`--secret` was given but `--auth` is `none`, so nothing would be injected");
-    }
-
-    let headers = set_headers
-        .iter()
-        .map(|raw| {
-            raw.split_once('=')
-                .map(|(key, value)| (key.trim().to_string(), value.to_string()))
-                .with_context(|| format!("`--set-header {raw}` should be `Name=Value`"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let auth = auth.to_spec()?;
+    let headers = parse_pairs(&set_headers, "--set-header")?;
 
     enroll::add_upstream(&path, &name, &base_url, &auth, &headers)?;
     println!("Added upstream `{name}` to {}.", path.display());
@@ -870,6 +1152,74 @@ fn add_upstream(options: AddUpstream) -> Result<()> {
         println!(
             "\nNo `[[acl]]` rules yet, so it is not reachable. Allow something with:\n  \
              mcp-iap acl add --target {name} --methods GET --paths '/**'"
+        );
+    }
+    Ok(())
+}
+
+/// `Name=Value` pairs from a repeatable flag. Splits on the *first* `=` only,
+/// because a secret reference (`op://vault/item/field`) may contain more.
+fn parse_pairs(raw: &[String], flag: &str) -> Result<Vec<(String, String)>> {
+    raw.iter()
+        .map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(key, value)| (key.trim().to_string(), value.to_string()))
+                .with_context(|| format!("`{flag} {entry}` should be `Name=Value`"))
+        })
+        .collect()
+}
+
+struct AddMcpServer {
+    path: PathBuf,
+    name: String,
+    url: Option<String>,
+    command: Option<String>,
+    args: Vec<String>,
+    env: Vec<String>,
+    cwd: Option<String>,
+    auth: AuthFlags,
+}
+
+fn add_mcp_server(options: AddMcpServer) -> Result<()> {
+    let AddMcpServer {
+        path,
+        name,
+        url,
+        command,
+        args,
+        env,
+        cwd,
+        auth,
+    } = options;
+
+    let transport = match (url, command) {
+        (Some(url), None) => enroll::McpTransportSpec::Http { url },
+        (None, Some(command)) => enroll::McpTransportSpec::Stdio {
+            command,
+            args,
+            env: parse_pairs(&env, "--env")?,
+            cwd,
+        },
+        // Neither is the interesting case: there is no default transport that
+        // would be right, and guessing one writes a server that cannot start.
+        (None, None) => bail!(
+            "`mcp-server add` needs `--url <URL>` for a remote server, or `--command <BIN>` \
+             for a stdio one"
+        ),
+        (Some(_), Some(_)) => unreachable!("clap rejects --url with --command"),
+    };
+
+    let auth = auth.to_spec()?;
+    enroll::add_mcp_server(&path, &name, &transport, &auth)?;
+    println!("Added MCP server `{name}` to {}.", path.display());
+    if enroll::rule_count(&path)? == 0 {
+        println!(
+            "\nNo `[[acl]]` rules yet, so it is not reachable — and an MCP server needs two \
+             kinds of rule:\n  \
+             mcp-iap acl add --kind mcp --target {name} --methods initialize \\\n    \
+                 --methods 'notifications/*' --methods ping --methods 'tools/list' --paths '**'\n  \
+             mcp-iap acl add --kind mcp --target {name} --methods 'tools/call' --paths 'get_*'"
         );
     }
     Ok(())
@@ -972,5 +1322,156 @@ fn tail_audit(path: &Path, lines: usize, agent: Option<&str>, target: Option<&st
         };
         eprintln!("no entries for {what}");
     }
+    Ok(())
+}
+
+fn list_profiles(vendor: Option<&str>, output: OutputArg) -> Result<()> {
+    let wanted = vendor.map(str::to_lowercase);
+    let profiles: Vec<_> = profiles::catalog()
+        .into_iter()
+        .filter(|profile| {
+            wanted
+                .as_ref()
+                .is_none_or(|vendor| profile.vendor.to_lowercase() == *vendor)
+        })
+        .collect();
+
+    if profiles.is_empty() {
+        // Silence here reads as "there are none", which is a different answer
+        // from "that vendor is not one of the ones with profiles".
+        bail!(
+            "no profiles for vendor `{}` — `mcp-iap profile list` shows every vendor there is",
+            vendor.unwrap_or("")
+        );
+    }
+
+    if matches!(output, OutputArg::Json) {
+        let rows: Vec<_> = profiles
+            .iter()
+            .map(|profile| {
+                serde_json::json!({
+                    "id": profile.id,
+                    "title": profile.title,
+                    "vendor": profile.vendor,
+                    "kind": profile.service.kind(),
+                    "endpoint": profile.endpoint(),
+                    "summary": profile.summary,
+                    "access": profile.access.iter().map(|a| &a.name).collect::<Vec<_>>(),
+                    "vars": profile.vars.iter().map(|v| &v.name).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+
+    let width = profiles.iter().map(|p| p.id.len()).max().unwrap_or(0);
+    let vendor_width = profiles.iter().map(|p| p.vendor.len()).max().unwrap_or(0);
+    println!(
+        "{:<width$}  {:<vendor_width$}  KIND  SUMMARY",
+        "PROFILE", "VENDOR"
+    );
+    for profile in &profiles {
+        println!(
+            "{:<width$}  {:<vendor_width$}  {:<4}  {}",
+            profile.id,
+            profile.vendor,
+            profile.service.kind(),
+            profile.summary
+        );
+    }
+    println!(
+        "\n`mcp-iap profile show <id>` for the detail, `profile add <id> --secret <ref>` to use one."
+    );
+    Ok(())
+}
+
+fn show_profile(id: &str) -> Result<()> {
+    let profile = profiles::get(id)?;
+    println!("{}  —  {}", profile.id, profile.title);
+    println!("{}\n", profile.summary);
+    println!("vendor      {}", profile.vendor);
+    println!("kind        {}", profile.service.kind());
+    println!("endpoint    {}", profile.endpoint());
+    println!("default as  {}", profile.default_name);
+    println!(
+        "credential  {}\n            create one at {}",
+        profile.credential.about, profile.credential.url
+    );
+
+    if !profile.vars.is_empty() {
+        println!("\nVARIABLES");
+        for var in &profile.vars {
+            let default = match &var.default {
+                Some(value) => format!(" (default `{value}`)"),
+                None => " (required)".to_string(),
+            };
+            println!("  --var {}=…{}\n      {}", var.name, default, var.about);
+        }
+    }
+
+    println!("\nACCESS LEVELS  (the first is the default)");
+    for level in &profile.access {
+        println!("  {}  —  {}", level.name, level.about);
+        for scope in &level.scopes {
+            println!("      scope  {scope}");
+        }
+        for rule in &level.rules {
+            println!(
+                "      {:<5} {} on {}",
+                rule.action,
+                rule.methods.join(", "),
+                rule.paths.join(", ")
+            );
+        }
+    }
+
+    if profile.service.kind() == "mcp" {
+        println!(
+            "\n  Every MCP profile also writes a session rule allowing {} —\n  \
+             without it `initialize` falls through to the default and the handshake fails.",
+            profiles::MCP_SESSION_METHODS.join(", ")
+        );
+    }
+
+    if let Some(note) = &profile.note {
+        println!("\nNOTE\n  {note}");
+    }
+    Ok(())
+}
+
+fn add_profile(path: &Path, id: &str, options: profiles::AddOptions) -> Result<()> {
+    let profile = profiles::get(id)?;
+    let dry_run = options.dry_run;
+    let added = profiles::add(path, &profile, &options)?;
+
+    if dry_run {
+        println!("\n# nothing was written — drop `--dry-run` to apply this.");
+        return Ok(());
+    }
+
+    println!(
+        "Added `{}` ({}) to {} at access level `{}`.",
+        added.name,
+        added.kind,
+        path.display(),
+        added.access
+    );
+    println!("  endpoint  {}", added.endpoint);
+    for scope in &added.scopes {
+        println!("  scope     {scope}");
+    }
+    println!("  rules     {}", added.rules.join(", "));
+
+    if let Some(note) = &added.note {
+        println!("\n{note}");
+    }
+
+    println!(
+        "\nNext:\n  mcp-iap agent add <agent-id> --target {}   # mints its token\n  \
+         mcp-iap check --config {}                  # proves the credential resolves",
+        added.name,
+        path.display()
+    );
     Ok(())
 }
