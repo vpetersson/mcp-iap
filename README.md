@@ -36,7 +36,10 @@ cargo build --release
 export ANTHROPIC_API_KEY=sk-...            # the key the proxy will inject
 ./target/release/mcp-iap check --config iap.toml
 
-# 3. Run it, with the approval console.
+# 3. See what the policy exposes, and to whom.
+./target/release/mcp-iap list --config iap.toml
+
+# 4. Run it, with the approval console.
 ./target/release/mcp-iap run --config iap.toml --tui
 ```
 
@@ -225,6 +228,48 @@ startup, so a locked vault fails the process rather than the tenth request.
 A bare value that is not one of these forms is rejected, and the error never
 echoes what you pasted.
 
+## What is exposed
+
+`check` validates; `list` inventories. At twenty service accounts and MCP servers
+on one proxy, "what does this thing front, and with whose credential?" is its own
+question, and the answer is one row per thing rather than a comma-joined line.
+
+```console
+$ mcp-iap list upstreams
+NAME       BASE URL                        AUTH                 CREDENTIAL
+anthropic  https://api.anthropic.com       header x-api-key     op://Private/Anthropic API/credential
+gcs        https://storage.googleapis.com  service_account_jwt  op://Private/GCP Service Account/credential
+github     https://api.github.com          bearer               op://Private/GitHub/token
+```
+
+`mcp-iap list` alone prints every section; `agents`, `upstreams`, `mcp` and `acl`
+narrow it to one. ACL rules keep their position in the file, because first match
+wins and that order *is* the policy.
+
+The question that actually matters once there is more than one agent is what a
+single one of them can reach — `targets` and the ACL intersected:
+
+```console
+$ mcp-iap list --agent ci-bot
+Everything `ci-bot` can address. Rules are in match order — first match wins.
+
+UPSTREAMS
+NAME    BASE URL                AUTH    CREDENTIAL                 RULES
+github  https://api.github.com  bearer  op://Private/GitHub/token  2
+stripe  https://api.stripe.com  bearer  op://Private/Stripe/key    none
+```
+
+`RULES` counts the rules that could ever reach that target as this agent, so
+`none` is the interesting value: `stripe` is in the agent's `targets`, which
+reads like a grant, but no rule names it — every call falls through to the
+default and is denied.
+
+`--output json` gives the same inventory for a fleet that gets inventoried by
+something other than a human. This reads only the policy file: it needs no
+running daemon, it never contacts 1Password, and it prints credential
+*references*, never a resolved secret. A `literal:` reference is the credential
+rather than a pointer to one, so it prints as `literal:***`.
+
 ## Multiple agents
 
 One proxy fronts many agents. That is the shape this is built for — the agents
@@ -411,7 +456,7 @@ metadata server and workload identity federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 104 tests: unit + end-to-end through a real proxy
+cargo test        # 124 tests: unit + end-to-end through a real proxy
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
