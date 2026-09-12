@@ -28,12 +28,12 @@ attached on the way out, after the policy has already said yes.
 ```bash
 cargo build --release
 
-# 1. Mint a token for the agent and paste the printed block into your policy file.
-./target/release/mcp-iap gen-token claude-code
-
-cp iap.example.toml iap.toml && $EDITOR iap.toml
+# 1. Write a policy file. This mints the agent's token and prints it once —
+#    only its sha256 goes in the file, so there is nothing left to fill in.
+./target/release/mcp-iap init
 
 # 2. Check the policy and prove every credential reference resolves.
+export ANTHROPIC_API_KEY=sk-...            # the key the proxy will inject
 ./target/release/mcp-iap check --config iap.toml
 
 # 3. Run it, with the approval console.
@@ -46,6 +46,20 @@ Point the agent at the proxy:
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080/anthropic
 export ANTHROPIC_AUTH_TOKEN=iap_...        # the token from step 1, not your API key
 ```
+
+`init` writes one agent, one upstream and default deny. To start from the
+annotated example instead — GitHub, an MCP server and a Google service account
+already worked out — use `init --template full`, which carries its own copy of
+`iap.example.toml` and so works from an installed binary with no checkout:
+
+```bash
+mcp-iap init --template full --agent claude-code     # one agent, every pattern
+mcp-iap init --secret op://Private/Anthropic/credential   # 1Password, not env
+mcp-iap init --force                                 # replace, minting a new token
+```
+
+Adding a second agent later is still `mcp-iap gen-token <id>`, which prints the
+`[[agents]]` block to paste.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -88,7 +102,8 @@ export ANTHROPIC_AUTH_TOKEN=iap_...        # the token from step 1, not your API
 
 ## The policy file
 
-`iap.example.toml` is a commented walk-through. The shape:
+`mcp-iap init` writes one; `iap.example.toml` is the commented walk-through it
+embeds under `--template full`. The shape:
 
 ```toml
 [[agents]]
@@ -312,7 +327,7 @@ GCP metadata server and workload identity federation are not wired up.
 ## Development
 
 ```bash
-cargo test        # 88 tests: unit + end-to-end through a real proxy
+cargo test        # 97 tests: unit + end-to-end through a real proxy
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

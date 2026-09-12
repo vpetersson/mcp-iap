@@ -400,8 +400,18 @@ impl Default for AclDefault {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config `{}`", path.display()))?;
+        let text = std::fs::read_to_string(path).map_err(|error| {
+            // Nothing here yet is the ordinary first-run state, and the answer
+            // is one command rather than a hunt for the example file.
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "no config at `{}` — run `mcp-iap init` to write one",
+                    path.display()
+                )
+            } else {
+                anyhow::Error::new(error).context(format!("reading config `{}`", path.display()))
+            }
+        })?;
         let config: Config = toml::from_str(&text)
             .with_context(|| format!("parsing config `{}`", path.display()))?;
         config.validate()?;

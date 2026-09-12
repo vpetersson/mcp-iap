@@ -8,6 +8,7 @@ use std::sync::Arc;
 use mcp_iap::audit;
 use mcp_iap::config::Config;
 use mcp_iap::identity;
+use mcp_iap::init::{self, InitOptions, Template};
 use mcp_iap::mcp;
 use mcp_iap::state::AppState;
 
@@ -37,6 +38,25 @@ struct ConfigArg {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Write a policy file, agent token and all, ready to run.
+    Init {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Id of the agent to mint a token for.
+        #[arg(long, default_value = init::DEFAULT_AGENT_ID)]
+        agent: String,
+        /// Credential reference for the starter upstream: `env:NAME`,
+        /// `file:/path` or `op://vault/item/field`. Starter template only.
+        #[arg(long, value_name = "REF")]
+        secret: Option<String>,
+        /// `starter` is one agent and one upstream; `full` is the annotated
+        /// example, with GitHub, MCP and a service account worked out.
+        #[arg(long, value_enum, default_value_t = TemplateArg::Starter)]
+        template: TemplateArg,
+        /// Replace an existing file. Mints a new token, retiring the old one.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Run the proxy.
     Run {
         #[command(flatten)]
@@ -77,6 +97,21 @@ enum Command {
     Audit(AuditCommand),
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum TemplateArg {
+    Starter,
+    Full,
+}
+
+impl From<TemplateArg> for Template {
+    fn from(arg: TemplateArg) -> Self {
+        match arg {
+            TemplateArg::Starter => Template::Starter,
+            TemplateArg::Full => Template::Full,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum AuditCommand {
     /// Prove the log has not been edited, reordered or truncated.
@@ -92,6 +127,19 @@ enum AuditCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Init {
+            config,
+            agent,
+            secret,
+            template,
+            force,
+        } => init_config(&InitOptions {
+            path: config.config,
+            agent,
+            secret,
+            template: template.into(),
+            force,
+        }),
         Command::Run { config, tui } => {
             let config = Config::load(&config.config)?;
             init_tracing(tui, &config)?;
@@ -374,6 +422,41 @@ fn check(path: &Path) -> Result<()> {
         );
     }
     println!("\nconfig is valid.");
+    Ok(())
+}
+
+/// Write a policy file and tell the operator what is left to do.
+///
+/// The token is printed rather than stored: only its hash went into the file,
+/// so this is the one moment it exists in plaintext.
+fn init_config(options: &InitOptions) -> Result<()> {
+    let written = init::init(options)?;
+    let path = written.path.display();
+
+    println!("Wrote {path} for agent `{}`.\n", written.agent);
+    println!("The agent's token — shown once, and not any upstream's credential:\n");
+    println!("  {}\n", written.token);
+
+    println!("Next:");
+    // Only `env:` has a step the operator can act on from here; anything else
+    // is somewhere `check` can look for itself.
+    if let Some(name) = written
+        .secret
+        .as_deref()
+        .and_then(|reference| reference.strip_prefix("env:"))
+    {
+        println!("  export {name}=...   # the credential the proxy injects on the way out");
+    }
+    println!("  mcp-iap check --config {path}   # resolves every credential reference");
+    println!("  mcp-iap run --config {path} --tui\n");
+
+    println!("Then point the agent at the proxy:");
+    println!(
+        "  export ANTHROPIC_BASE_URL=http://{}/anthropic",
+        written.listen
+    );
+    println!("  export ANTHROPIC_AUTH_TOKEN={}", written.token);
+    println!("\nAdd another agent with `mcp-iap gen-token <id>`.");
     Ok(())
 }
 
