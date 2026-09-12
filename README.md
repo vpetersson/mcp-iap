@@ -8,21 +8,142 @@ An identity-aware proxy for LLM agents.
 Everything else here — the ACL, the interactive prompt, the tamper-evident audit
 log — exists to make that grant narrow, observable and revocable.
 
-```
-  agent ──IAP token──▶  mcp-iap  ──real credential──▶  api.anthropic.com
-                          │                             api.github.com
-                          │                             an MCP server
-                          ├─ who is this?      (agent token → identity)
-                          ├─ what is this run? (workload token → scope, expiring)
-                          ├─ may it do this?   (ACL: allow / deny / ask)
-                          ├─ ask a human       (TUI, Little Snitch style)
-                          └─ write it down     (hash-chained JSONL)
+```mermaid
+flowchart LR
+    subgraph agents["agent VLAN — ephemeral, holds no real credential"]
+        A1["Claude Code"]
+        A2["Codex"]
+        A3["CI runner"]
+    end
+
+    subgraph iap["mcp-iap — where the credentials live"]
+        direction TB
+        ID["who is this?<br/>agent token → identity"]
+        WL["what is this run?<br/>workload token → scope, expiring"]
+        ACL{"may it do this?<br/>ACL, default deny"}
+        ASK["ask a human<br/>TUI, Little Snitch style"]
+        INJ["attach the real credential"]
+        LOG[["write it down<br/>hash-chained JSONL"]]
+        ID --> WL --> ACL
+        ACL -->|"allow"| INJ
+        ACL -->|"ask"| ASK
+        ASK -->|"allowed"| INJ
+        ACL -->|"deny"| LOG
+        ASK -->|"denied, or nobody answered"| LOG
+        INJ --> LOG
+    end
+
+    SM[("1Password / env / file")]
+
+    subgraph up["upstreams"]
+        U1["api.anthropic.com"]
+        U2["api.github.com"]
+        U3["an MCP server"]
+    end
+
+    A1 -->|"iap_…"| ID
+    A2 -->|"iap_…"| ID
+    A3 -->|"iap_…"| ID
+    SM -.->|"resolved at startup"| INJ
+    INJ -->|"real credential"| U1
+    INJ --> U2
+    INJ --> U3
 ```
 
 The agent holds a token minted by the proxy. It is not an API key, it buys
 nothing anywhere else, and revoking it rotates nothing. The real credential is
 resolved from 1Password (or the environment, or a file) inside the proxy and
 attached on the way out, after the policy has already said yes.
+
+## Why this exists
+
+The setup this was built for: agents run on a VLAN of their own, ephemeral, and
+all they can reach is the internet, a model API and a dedicated GitHub account.
+Nothing in that VLAN holds a credential worth stealing — which is exactly what
+makes it safe to hand an agent a repository and let it work unattended.
+
+That stops working the moment the task is not code. Build a report from Google
+Analytics, check a setting in Cloudflare, pull numbers out of a third-party
+dashboard, and the agent needs a credential for a system that was never part of
+the arrangement. The two usual answers are both bad:
+
+- **Paste the key into the agent.** It is now in an environment, a config file,
+  a context window, and whatever got logged on the way past. It works from
+  anywhere, it does everything that key can do, it lasts until a human remembers
+  to rotate it, and the upstream's own audit log will tell you the key was used
+  — not which agent used it. A prompt injection and a stolen laptop are the same
+  event from the upstream's point of view.
+- **Do it yourself.** The agent stops at the boundary and a human copies numbers
+  between tabs, which is the work you were trying to hand over.
+
+The missing piece is not a better vault. It is the answer to a narrower
+question: *can this agent, right now, make this one call against this service* —
+answered without the agent ever holding the thing that makes the call work.
+
+### What the proxy changes
+
+The agent gets a token minted by the proxy. It is not an API key: it buys
+nothing anywhere else, it names one agent, and deleting one line revokes it
+without rotating anything real. The credential stays on the proxy's side of the
+boundary and is attached on the way out, after policy has already said yes.
+
+```mermaid
+flowchart TB
+    subgraph before["The agent holds the API key"]
+        direction TB
+        K["CLOUDFLARE_API_TOKEN<br/>in the agent's environment"]
+        K --> K1["works from anywhere"]
+        K --> K2["every zone, every verb"]
+        K --> K3["revoking it breaks<br/>everything else using it"]
+        K --> K4["upstream log says<br/>the key was used"]
+    end
+
+    subgraph after["The agent holds an IAP token"]
+        direction TB
+        T["IAP_TOKEN=iap_…<br/>in the agent's environment"]
+        T --> T1["works only against this proxy"]
+        T --> T2["only the paths the ACL allows,<br/>default deny"]
+        T --> T3["revoked by deleting one line<br/>— nothing real rotates"]
+        T --> T4["every call names the agent<br/>and the rule that permitted it"]
+    end
+```
+
+So a leaked agent context leaks a token whose entire power is the ACL, and the
+blast radius of a compromised agent is that rule set rather than the API key's
+own scope. That is the whole argument; § Security model is the same claim with
+its limits attached.
+
+### Where it sits
+
+Little Snitch asks a human before an application is allowed to reach the
+network. A secrets manager — 1Password, Vault, [OpenBao](https://openbao.org) —
+decides who may *read* a credential. This is the join of the two: the secrets
+manager's answer is resolved inside the proxy and never handed to the caller,
+and the per-connection question Little Snitch asks gets asked per credentialed
+call instead, with the answer written down.
+
+It is deliberately none of the following. It is not a secrets manager — it
+reads from yours. It is not a firewall — allowing a call is not opening the
+network, and the agent VLAN still needs its own rules. It is not a sandbox — it
+constrains what an agent can *reach*, never what it can compute.
+
+### How long a grant lasts
+
+Policy is not a clock, and it is not trying to be: a rule is true until you
+change it, an `ask` is answered per call, and "remember for this session" dies
+with the process. Two things here do expire, and between them they are what
+"give it Google Analytics for the next hour" means.
+
+The agent's own credential expires under § Workload identity. The agent trades
+its standing token for one scoped to the work actually in front of it, valid for
+an hour at most, and once that lapses the copy left behind in a context window
+buys nothing. The default mode is `optional`, so until you set `required` the
+standing agent token still works and the bound is one the agent opted into —
+`required` is what turns it into a bound you imposed.
+
+The credentials the proxy mints *upstream* expire too
+(`oauth2_client_credentials`, `service_account_jwt`), on the provider's clock
+rather than yours. The agent never sees those at all.
 
 ## Quickstart
 
@@ -78,6 +199,13 @@ mcp-iap init --force                                 # replace an existing file
 `--template full` carries its own copy of `iap.example.toml`, so it works from an
 installed binary with no checkout.
 
+For a service that already has a profile, step 2 is one command that writes the
+upstream *and* its rules — see [§ Profiles](#profiles):
+
+```bash
+mcp-iap profile add cloudflare --secret op://Private/Cloudflare/token
+```
+
 The enrolment commands compose the same way for everything else:
 
 ```bash
@@ -120,7 +248,138 @@ cases where the policy file is generated by something other than this CLI.
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Profiles
+
+For a service someone has already worked out, `profile add` writes the whole
+thing — base URL, credential scheme, OAuth scopes and a set of rules narrow
+enough to be worth calling a policy:
+
+```bash
+mcp-iap profile list
+mcp-iap profile show graylog
+mcp-iap profile add graylog --secret op://Private/Graylog/token \
+    --var host=graylog.example.com:9000
+```
+
+That last command knows three things you would otherwise have to look up:
+Graylog's API hangs off `/api`, it authenticates an access token as basic
+`<token>:token` with the *token in the user field*, and its searches are POSTs
+so a GET-only "read" level cannot read anything. Getting any of those wrong
+fails late — a 401 with no detail, or a rule that quietly grants more than you
+meant.
+
+`--secret` is the same credential reference every other command takes, and
+`profile add` never asks for a credential itself. `--dry-run` prints the exact
+TOML it would append and writes nothing, because a policy you have not read is
+not a policy you can rely on.
+
+| Flag | |
+| --- | --- |
+| `--as <name>` | name it something else — this is how one proxy fronts two accounts of the same service |
+| `--access <level>` | which bundle of scopes and rules; defaults to the narrowest the profile has |
+| `--var name=value` | what is yours rather than the vendor's: a self-hosted host, a region, an API login |
+| `--agent <id>` | scope the rules to one agent instead of all of them |
+| `--dry-run` | print, do not write |
+
+Access levels are per profile and `profile show` lists them. They differ in
+scopes as well as paths, which is the part that is easy to get wrong by hand:
+Search Console's `read` asks Google for `webmasters.readonly` and its `write`
+asks for `webmasters`, and no amount of ACL gets a `readonly` token to submit a
+sitemap.
+
+Two levels are worth knowing about because they exist for reasons that are not
+about permissions:
+
+- **`cloudflare --access ask-writes`** allows GET, denies DELETE outright, and
+  parks everything else for a human. The ACL cannot tell a reasonable POST from
+  a destructive one; this is where `ask` earns its place.
+- **`dataforseo`** defaults to a level that allows the queued endpoints and makes
+  the `live` ones prompt. Nothing in the method or the path says one costs more
+  than the other, and an agent has no way to know.
+
+### What is in the catalog
+
+Everything the profiles cover is reachable without them — a profile is a
+starting point that writes ordinary TOML, not a special case in the proxy.
+
+| Vendor | Profiles |
+| --- | --- |
+| Google | `google-search-console`, `google-analytics-data`, `google-analytics-admin`, `google-indexing`, `google-bigquery`, `google-drive`, `google-sheets`, `google-cloud-logging`, `google-cloud-storage` — all one service account, all `service_account_jwt` |
+| Cloudflare | `cloudflare` (the whole `client/v4` surface), plus `cloudflare-mcp-*` for each of the sixteen hosted MCP servers |
+| PostHog | `posthog` (REST), `posthog-mcp` |
+| DataForSEO | `dataforseo`, `dataforseo-mcp` |
+| Graylog | `graylog` |
+| Others | `anthropic`, `openai`, `github`, `linear`, `sentry`, `slack`, `stripe` |
+
+`mcp-iap profile list --output json` for a machine, `--vendor google` to narrow
+it.
+
+Two honest limits, both printed by `profile show`:
+
+- **Cloudflare's hosted MCP servers speak OAuth, not API tokens.** The
+  `cloudflare-mcp-*` profiles therefore run them through `npx mcp-remote`, which
+  does the browser flow and caches the grant. The proxy still rules on and logs
+  every JSON-RPC message, but the credential lives in the child's cache rather
+  than in the proxy. For a credential the proxy actually holds, the `cloudflare`
+  REST profile covers the same services.
+- **Tool catalogs move.** PostHog exposes well over a thousand tools, so its
+  `read` level allows the read verbs and sends everything else to `ask` rather
+  than denying it. Watch the audit log for `ask` rows and promote the ones you
+  want.
+
+## Enrolling anything else
+
+The enrolment commands cover every scheme the proxy supports, including the two
+that mint a token rather than forwarding a secret:
+
+```bash
+# A Google service account, no editor and no JSON key in the file.
+mcp-iap upstream add gsc --base-url https://searchconsole.googleapis.com \
+    --auth service-account-jwt --key-file op://Private/GCP/credential \
+    --scope https://www.googleapis.com/auth/webmasters.readonly
+
+# An API whose *user* field is the credential.
+mcp-iap upstream add graylog --base-url https://graylog.example.com/api \
+    --auth basic --username-secret op://Private/Graylog/token --secret literal:token
+
+# MCP servers, remote and local.
+mcp-iap mcp-server add posthog --url https://mcp.posthog.com/mcp \
+    --auth bearer --secret op://Private/PostHog/key
+mcp-iap mcp-server add notes --command notes-mcp --arg --stdio \
+    --env NOTES_TOKEN=op://Private/Notes/token
+```
+
+`--username-secret` is for the APIs that put the credential in the user half of
+basic auth — Graylog's `<token>:token`, and its session-token variant. Spelling
+that with a plain `--username` would mean the token itself living in a file
+meant to be committable, so the user field takes a reference and the password
+takes the scheme's documented constant. That constant is the one `literal:`
+the loader does not complain about, and only in that position: a `literal:` in
+`--username-secret` is still refused.
+
 ## What happens to a request
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Agent
+    participant IAP as mcp-iap
+    participant You as You, at the TUI
+    participant API as api.cloudflare.com
+
+    Agent->>IAP: POST /cloudflare/zones/.../purge_cache<br/>Authorization: Bearer iap_...
+    IAP->>IAP: identify — sha256 of the token names the agent
+    IAP->>IAP: route — the path prefix selects the cloudflare upstream
+    IAP->>IAP: scope — a workload token must cover this request
+    IAP->>IAP: decide — first matching ACL rule says ask
+    IAP->>You: park the request: this agent wants this call
+    You-->>IAP: allow, this once
+    IAP->>IAP: strip the agent's token, attach the real credential
+    IAP->>API: POST /zones/.../purge_cache
+    API-->>IAP: 200
+    IAP->>IAP: record — one JSONL line, chained to the one before
+    IAP-->>Agent: 200, streamed back — never the credential
+```
 
 1. **Identify.** The agent sends `Authorization: Bearer <iap-token>` (or
    `X-IAP-Token`). Only the token's sha256 is stored in the policy file. If it
@@ -170,6 +429,9 @@ action = "allow"                    # allow | deny | ask
 action = "deny"
 ```
 
+An `[[mcp_servers]]` block has the same shape, and `mcp-iap mcp-server add`
+writes one. Both it and `upstream add` take every credential scheme below.
+
 `*` and `**` are globs. In `paths`, `*` stops at `/` and `**` crosses it, so
 `/repos/*` does not silently grant everything under `/repos`. Unknown keys are a
 hard error — a typo must never quietly widen access.
@@ -180,7 +442,7 @@ hard error — a typo must never quietly widen access.
 | --- | --- |
 | `bearer` | `Authorization: Bearer <secret>` |
 | `header` | any header, with an optional `prefix` |
-| `basic` | `Authorization: Basic base64(username:secret)` |
+| `basic` | `Authorization: Basic base64(username:secret)`, or `username_secret` when the *user* field is the credential |
 | `query` | appends `?param=<secret>` |
 | `oauth2_client_credentials` | fetches and caches an access token, refreshed a minute before expiry |
 | `service_account_jwt` | signs a JWT with a service-account key and exchanges it for a short-lived token — see below |
@@ -477,6 +739,18 @@ Policy and audit stay in one process, so `tools/call` shows up in the same log
 and the same approval queue as an HTTP call:
 
 ```toml
+# The session. `initialize` names no tool, so it matches only a rule that
+# leaves `paths` unconstrained — without this one the handshake is denied and
+# the agent sees a server that never starts. It goes first.
+[[acl]]
+name = "github-mcp-session"
+kind = "mcp"
+target = "github-mcp"
+methods = ["initialize", "notifications/*", "ping", "tools/list"]
+paths = ["**"]
+action = "allow"
+
+# Then the tools.
 [[acl]]
 kind = "mcp"
 target = "github-mcp"
@@ -485,12 +759,15 @@ paths = ["get_*", "list_*", "search_*"]   # `paths` is the tool name here
 action = "allow"
 ```
 
-`resources/read` matches on the URI instead. A method that names nothing —
-`tools/list`, `initialize` — only matches a rule that places no constraint on
-`paths`. A denied call gets a JSON-RPC error (`-32001`); a denied notification is
-dropped. A batch is all-or-nothing, so ids never desynchronise. If the daemon is
-unreachable the bridge refuses to start, and if an authorization call fails the
-call is denied.
+That first rule is the one everybody forgets, so `mcp-iap check` warns when an
+MCP server has rules and none of them admits `initialize` — the failure it
+prevents is a `<default>` deny that names no rule to go and fix. Every
+`profile add` for an MCP server writes it for you.
+
+`resources/read` matches on the URI instead. A denied call gets a JSON-RPC error
+(`-32001`); a denied notification is dropped. A batch is all-or-nothing, so ids
+never desynchronise. If the daemon is unreachable the bridge refuses to start,
+and if an authorization call fails the call is denied.
 
 ## The audit log
 
@@ -605,14 +882,14 @@ streams are not); mTLS agent identity, which is the missing half of § Workload
 identity — the token proves what a run may do, and a client certificate is what
 would prove the run is still the one holding it; per-workload ACL rules, so
 policy could name a workload label and not just an agent; native 1Password
-Connect (the CLI is shelled out to today). On service accounts specifically: only RSA keys are
-supported (Google issues RS256 keys, so this covers Google), and the GCP
-metadata server and workload identity federation are not wired up.
+Connect (the CLI is shelled out to today). On service accounts specifically:
+only RSA keys are supported (Google issues RS256 keys, so this covers Google),
+and the GCP metadata server and workload identity federation are not wired up.
 
 ## Development
 
 ```bash
-cargo test        # 141 tests: unit + end-to-end through a real proxy
+cargo test        # 200 tests: unit + end-to-end through a real proxy
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -621,6 +898,12 @@ The end-to-end suite starts a proxy in front of a mock upstream and asserts the
 properties that matter: the upstream receives the real key, the agent's token
 stops at the proxy, denied calls never reach the network, an `ask` releases only
 when a human answers, and the resulting log verifies.
+
+`tests/profiles_e2e.rs` does the same for the profiles, and builds its policy
+with `profile add` rather than a fixture — so a profile whose base URL, scheme
+or rules are wrong fails in CI rather than against the vendor. Every profile at
+every access level is materialised and run through the daemon's own
+`validate()`, and every MCP profile is asserted to admit `initialize`.
 
 CI runs exactly the three commands above on Linux and macOS, plus `cargo audit`
 over the dependency tree — a dependency with a known advisory fails the build —
